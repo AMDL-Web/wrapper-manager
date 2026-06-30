@@ -506,6 +506,7 @@ func main() {
 	flag.StringVar(&PROXY, "proxy", "", "proxy for wrapper and manager")
 	flag.StringVar(&DeviceInfo, "device-info", "Music/5.0.2/Android/10/Pixel 10/7663314/en-US/en-US/dc28071e371c439e", "device info for wrapper")
 	flag.Parse()
+	_ = mirror
 
 	log.SetOutput(os.Stdout)
 	if *debug {
@@ -523,12 +524,7 @@ func main() {
 	}
 
 	if _, err := os.Stat("data/wrapper/wrapper"); errors.Is(err, os.ErrNotExist) {
-		log.Warn("wrapper does not exist, downloading...")
-		err = os.MkdirAll("data/wrapper", 0777)
-		if err != nil {
-			panic(err)
-		}
-		PrepareWrapper(*mirror)
+		log.Panicln("wrapper binary not found in data/wrapper/wrapper. Please build and place it there first.")
 	}
 
 	if _, err := os.Stat("data/storefront_ids.json"); errors.Is(err, os.ErrNotExist) {
