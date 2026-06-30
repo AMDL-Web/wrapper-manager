@@ -184,8 +184,8 @@ func wrapperReady(instance *WrapperInstance) {
 	WMDispatcher.AddInstance(instance)
 	instance.NoRestart = false
 	go LoginDoneHandler(instance.Id)
-	log.Info(fmt.Sprintf("[wrapper %s]", strings.Split(instance.Id, "-")[0]), " Wrapper ready")
-	if len(Instances) == ShouldStartInstances {
+	log.Infof("[wrapper %s] Wrapper ready. len(Instances)=%d, ShouldStartInstances=%d", strings.Split(instance.Id, "-")[0], len(Instances), ShouldStartInstances)
+	if len(Instances) >= ShouldStartInstances {
 		Ready = true
 	}
 }
@@ -216,9 +216,10 @@ func KillWrapper(id string) error {
 }
 
 func provide2FACode(id string, code string) {
-	err := os.WriteFile("data/wrapper/rootfs/data/instances/"+id+"/2fa.txt", []byte(code), 0777)
+	path := "data/wrapper/rootfs/data/instances/"+id+"/2fa.txt"
+	err := os.WriteFile(path, []byte(code), 0777)
 	if err != nil {
-		panic(err)
+		log.Warnf("failed to write 2fa.txt: %v", err)
 	}
 }
 

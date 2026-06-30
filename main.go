@@ -34,9 +34,9 @@ type server struct {
 func (s *server) Status(c context.Context, req *emptypb.Empty) (*pb.StatusReply, error) {
 	p, ok := peer.FromContext(c)
 	if ok {
-		log.Infof("status request from %s", p.Addr.String())
+		log.Infof("status request from %s. ClientCount: %d, Ready: %v, ShouldStart: %d", p.Addr.String(), len(Instances), Ready, ShouldStartInstances)
 	} else {
-		log.Infof("status request from unknown peer")
+		log.Infof("status request from unknown peer. ClientCount: %d, Ready: %v, ShouldStart: %d", len(Instances), Ready, ShouldStartInstances)
 	}
 	var regions []string
 	for _, instance := range Instances {
