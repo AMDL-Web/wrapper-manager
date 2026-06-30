@@ -542,8 +542,12 @@ func main() {
 	if _, err := os.Stat("data/instances.json"); !errors.Is(err, os.ErrNotExist) {
 		instancesInFile := LoadInstance()
 		ShouldStartInstances = len(instancesInFile)
-		for _, inst := range instancesInFile {
-			go WrapperStart(inst.Id)
+		if ShouldStartInstances == 0 {
+			Ready = true
+		} else {
+			for _, inst := range instancesInFile {
+				go WrapperStart(inst.Id)
+			}
 		}
 	} else {
 		ShouldStartInstances = 0
