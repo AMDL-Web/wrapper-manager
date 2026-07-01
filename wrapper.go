@@ -72,8 +72,14 @@ func WrapperInitial(account string, password string) {
 		panic(err)
 	}
 
+	err = os.WriteFile("data/wrapper/rootfs/data/instances/"+id.String()+"/ACCOUNT", []byte(account), 0777)
+	if err != nil {
+		log.Warnf("failed to write ACCOUNT file: %v", err)
+	}
+
 	instance := WrapperInstance{
 		Id:          id.String(),
+		Account:     account,
 		DecryptPort: GenerateUniquePort(),
 		M3U8Port:    GenerateUniquePort(),
 		NoRestart:   true,
@@ -113,9 +119,16 @@ func WrapperInitial(account string, password string) {
 	go wrapperDown(&instance)
 }
 
-func WrapperStart(id string) {
+func WrapperStart(id string, account string) {
+	if account == "" {
+		accountBytes, err := os.ReadFile("data/wrapper/rootfs/data/instances/" + id + "/ACCOUNT")
+		if err == nil {
+			account = string(accountBytes)
+		}
+	}
 	instance := WrapperInstance{
 		Id:          id,
+		Account:     account,
 		DecryptPort: GenerateUniquePort(),
 		M3U8Port:    GenerateUniquePort(),
 		NoRestart:   false,
@@ -195,7 +208,7 @@ func wrapperDown(instance *WrapperInstance) {
 	RemoveInstance(instance)
 	WMDispatcher.RemoveInstance(instance.Id)
 	if !instance.NoRestart {
-		go WrapperStart(instance.Id)
+		go WrapperStart(instance.Id, instance.Account)
 	} else {
 		SaveInstances()
 	}

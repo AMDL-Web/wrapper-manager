@@ -39,9 +39,13 @@ func (s *server) Status(c context.Context, req *emptypb.Empty) (*pb.StatusReply,
 		log.Infof("status request from unknown peer. ClientCount: %d, Ready: %v, ShouldStart: %d", len(Instances), Ready, ShouldStartInstances)
 	}
 	var regions []string
+	var accounts []string
 	for _, instance := range Instances {
 		if !slices.Contains(regions, instance.Region) {
 			regions = append(regions, instance.Region)
+		}
+		if instance.Account != "" {
+			accounts = append(accounts, instance.Account)
 		}
 	}
 	return &pb.StatusReply{
@@ -54,6 +58,7 @@ func (s *server) Status(c context.Context, req *emptypb.Empty) (*pb.StatusReply,
 			Regions:     regions,
 			ClientCount: int32(len(Instances)),
 			Ready:       Ready,
+			Accounts:    accounts,
 		},
 	}, nil
 }
@@ -546,7 +551,7 @@ func main() {
 			Ready = true
 		} else {
 			for _, inst := range instancesInFile {
-				go WrapperStart(inst.Id)
+				go WrapperStart(inst.Id, inst.Account)
 			}
 		}
 	} else {
