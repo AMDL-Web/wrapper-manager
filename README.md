@@ -38,3 +38,20 @@ docker compose up
 ## Login
 You can use [WorldObservationLog/AppleMusicDecrypt](https://github.com/WorldObservationLog/AppleMusicDecrypt) `tools/login.py` to log in, or use tools such as Postman to import `proto/manager.proto` to log in. The process is as follows:
 ![flowchart.png](/flowchart.png)
+
+## AMDL-Web Fork Enhancements
+
+This repository is forked to implement several performance optimizations, thread-safety mechanisms, and functional enhancements:
+
+- **Thread-safe Decryption Connection Pool**: Introduces a robust connection pooling mechanism to manage decryption worker connections dynamically and thread-safely under heavy parallel requests.
+- **Disabled Auto-Download**: Disabled the automated downloading of wrapper binaries at startup. All dependencies are pre-configured locally to ensure offline usability, startup predictability, and deployment isolation.
+- **Resilient Readiness Logic**:
+  - If `instances.json` exists but contains zero instances, the server successfully initializes with `Ready = true` instead of entering a blocked state.
+  - Core readiness checks and instance status transitions are fully thread-safe.
+  - Hardened state transitions to prevent panics during the 2FA login verification flow.
+- **Status API Extension**: The gRPC status check endpoint now returns the list of active decrypted accounts, facilitating easier integration and monitoring.
+- **Upstream Adjustments & Bug Fixes**:
+  - Adaptations for recent Apple token structure updates.
+  - Enhanced error handling when `checkAvailableOnRegion` fails due to network issues (returns clean errors instead of crashing).
+  - Fixed standard panics caused by nil interface conversions.
+  - Restored missing `SelectInstance` validations for music videos.
