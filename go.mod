@@ -15,10 +15,13 @@ require (
 )
 
 require (
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/AMDL-Web/wrapper-manager/proto v0.1.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/stretchr/testify v1.9.0 // indirect
 	golang.org/x/net v0.42.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.27.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250707201910-8d1bb00bc6a7 // indirect
 )
+
+replace github.com/AMDL-Web/wrapper-manager/proto => ./proto
