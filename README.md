@@ -29,7 +29,7 @@ Usage of ./wrapper-manager:
 ## Deploy
 For Chinese users: Please uncomment the sixth line of `Dockerfile` and configure the mirror and proxy in `docker-compose.yml`
 ```shell
-git clone https://github.com/WorldObservationLog/wrapper-manager
+git clone https://github.com/AMDL-Web/wrapper-manager
 cd wrapper-manager
 nano docker-compose.yml
 docker compose up

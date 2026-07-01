@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package manager.v1;
 
-option go_package = "wrapper-manager/proto;proto";
+option go_package = "github.com/AMDL-Web/wrapper-manager/proto;proto";
 import "google/protobuf/empty.proto";
 
 service WrapperManagerService {
@@ -117,6 +117,8 @@ message LyricsDataRequest {
   string adam_id = 1;
   string region = 2;
   string language = 3;
+  string type = 4;
+  bool extend_ttml_localizations = 5;
 }
 
 message LyricsReply {

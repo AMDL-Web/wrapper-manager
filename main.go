@@ -5,7 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	pb "github.com/WorldObservationLog/wrapper-manager/proto"
+	pb "github.com/AMDL-Web/wrapper-manager/proto"
 	"github.com/gofrs/uuid/v5"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
