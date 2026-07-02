@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 func parseStorefrontID(id string) string {
@@ -102,7 +101,6 @@ func WrapperInitial(account string, password string) {
 
 	cmd := exec.Command("./wrapper", args...)
 	cmd.Dir = "data/wrapper/"
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -150,7 +148,6 @@ func WrapperStart(id string, account string) {
 
 	cmd := exec.Command("./wrapper", args...)
 	cmd.Dir = "data/wrapper/"
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -228,11 +225,12 @@ func KillWrapper(id string) error {
 	if instance.Cmd.Process == nil {
 		return fmt.Errorf("instance %s process is nil", id)
 	}
-	pgid, err := syscall.Getpgid(instance.Cmd.Process.Pid)
-	if err == nil {
-		return syscall.Kill(-pgid, syscall.SIGKILL)
+	// Send SIGINT to trigger wrapper's internal child-killing signal handler
+	err := instance.Cmd.Process.Signal(os.Interrupt)
+	if err != nil {
+		return instance.Cmd.Process.Kill()
 	}
-	return instance.Cmd.Process.Kill()
+	return nil
 }
 
 func provide2FACode(id string, code string) {
