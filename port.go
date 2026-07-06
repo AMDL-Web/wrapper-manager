@@ -26,7 +26,7 @@ func isPortAvailable(port int) bool {
 
 func GenerateUniquePort() int {
 	const minPort = 10000
-	const maxPort = 65525
+	const maxPort = 10050
 
 	portMutex.Lock()
 	defer portMutex.Unlock()
