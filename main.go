@@ -147,6 +147,14 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 	} else {
 		log.Infof("decrypt stream from unknown peer")
 	}
+	var session *DecryptSession
+	var sessionAdamId string
+	defer func() {
+		if session != nil {
+			session.Close()
+		}
+	}()
+
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -167,40 +175,25 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 			})
 			continue
 		}
-		task := Task{
-			AdamId:  req.Data.AdamId,
-			Key:     req.Data.Key,
-			Payload: req.Data.Sample,
-			Result:  make(chan *Result),
-		}
-		available := false
-		for _, inst := range Instances {
-			ok, err := checkAvailableOnRegion(req.Data.AdamId, inst.Region, false)
+		if session == nil || sessionAdamId != req.Data.AdamId {
+			if session != nil {
+				session.Close()
+			}
+			session, err = WMDispatcher.OpenSession(req.Data.AdamId, req.Data.Key)
 			if err != nil {
-				_ = stream.Send(&pb.DecryptReply{
-					Header: &pb.ReplyHeader{
-						Code: -1,
-						Msg:  err.Error(),
-					},
-					Data: &pb.DecryptData{
-						AdamId:      req.Data.AdamId,
-						Key:         req.Data.Key,
-						Sample:      req.Data.Sample,
-						SampleIndex: req.Data.SampleIndex,
-					},
-				})
-				break
+				_ = stream.Send(decryptErrorReply(req.Data, err))
+				session = nil
+				continue
 			}
-			if ok {
-				available = true
-				break
-			}
+			sessionAdamId = req.Data.AdamId
 		}
-		if !available {
+
+		result, decryptErr := session.Decrypt(req.Data.AdamId, req.Data.Key, req.Data.Sample)
+		if decryptErr != nil {
 			_ = stream.Send(&pb.DecryptReply{
 				Header: &pb.ReplyHeader{
 					Code: -1,
-					Msg:  "no available instance",
+					Msg:  decryptErr.Error(),
 				},
 				Data: &pb.DecryptData{
 					AdamId:      req.Data.AdamId,
@@ -209,23 +202,7 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 					SampleIndex: req.Data.SampleIndex,
 				},
 			})
-			continue
-		}
-		go WMDispatcher.Submit(&task)
-		result := <-task.Result
-		if result.Error != nil {
-			_ = stream.Send(&pb.DecryptReply{
-				Header: &pb.ReplyHeader{
-					Code: -1,
-					Msg:  result.Error.Error(),
-				},
-				Data: &pb.DecryptData{
-					AdamId:      req.Data.AdamId,
-					Key:         req.Data.Key,
-					Sample:      req.Data.Sample,
-					SampleIndex: req.Data.SampleIndex,
-				},
-			})
+			session = nil // Decrypt discarded the failed connection.
 		} else {
 			_ = stream.Send(&pb.DecryptReply{
 				Header: &pb.ReplyHeader{
@@ -236,10 +213,19 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 					AdamId:      req.Data.AdamId,
 					Key:         req.Data.Key,
 					SampleIndex: req.Data.SampleIndex,
-					Sample:      result.Data,
+					Sample:      result,
 				},
 			})
 		}
+	}
+}
+
+func decryptErrorReply(data *pb.DecryptData, err error) *pb.DecryptReply {
+	return &pb.DecryptReply{
+		Header: &pb.ReplyHeader{Code: -1, Msg: err.Error()},
+		Data: &pb.DecryptData{
+			AdamId: data.AdamId, Key: data.Key, Sample: data.Sample, SampleIndex: data.SampleIndex,
+		},
 	}
 }
 
