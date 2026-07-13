@@ -1,19 +1,28 @@
-FROM golang:1.23 as builder
+FROM --platform=$BUILDPLATFORM golang:1.23 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 
+COPY go.mod go.sum ./
+COPY proto/go.mod proto/go.sum ./proto/
+RUN go mod download
+
 COPY . .
-# RUN go env -w GO111MODULE=on && go env -w GOPROXY=https://goproxy.cn,direct
-RUN go mod tidy
-RUN GOOS=linux go build -o wrapper-manager
+RUN test "$TARGETARCH" = "amd64" && \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -ldflags="-s -w" -o /out/wrapper-manager .
 
-FROM ubuntu:latest
+FROM ubuntu:24.04
 
-WORKDIR /root/
+WORKDIR /root
 
-COPY --from=builder /app/wrapper-manager .
-RUN apt-get update && apt-get install -y ca-certificates
-RUN chmod +x ./wrapper-manager
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/wrapper-manager ./wrapper-manager
 
 ENTRYPOINT ["./wrapper-manager"]
 EXPOSE 8080

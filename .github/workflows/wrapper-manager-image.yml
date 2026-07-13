@@ -1,52 +1,57 @@
-name: wrapper-manager-image-build
+name: Build amd64 Docker image
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
   workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: wrapper-manager-amd64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/amdl-web/wrapper-manager
 
 jobs:
-
-  build:
+  docker:
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.23'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-    - name: Build
-      run: go build .
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name:  Download wrapper-manager basic image
-      run: wget https://github.com/WorldObservationLog/wrapper-manager/releases/download/wrapper-manager-image/wrapper-manager.qcow2
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
 
-    - name: Mount image
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y qemu-utils
-        sudo modprobe nbd max_part=8
-        sudo qemu-nbd --connect=/dev/nbd0 wrapper-manager.qcow2
-        sudo mkdir /mnt/wrapper-manager
-        sudo mount /dev/nbd0p3 /mnt/wrapper-manager/
-
-    - name: Prepare wrapper-manager
-      run: |
-        sudo mkdir /mnt/wrapper-manager/root/wrapper-manager
-        sudo mv wrapper-manager /mnt/wrapper-manager/root/wrapper-manager
-        sudo bash -c 'cd /mnt/wrapper-manager/root/wrapper-manager && ./wrapper-manager -prepare'
-
-    - name: Unmount image
-      run: |
-        sudo umount /mnt/wrapper-manager/
-        sudo qemu-nbd --disconnect /dev/nbd0
-      
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: wrapper-manager-image
-        path: wrapper-manager.qcow2
+      - name: Build and publish amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
