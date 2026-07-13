@@ -16,6 +16,13 @@ import (
 	"strings"
 )
 
+const (
+	wrapperReleaseTag = "wrapper.x86_64.latest"
+	wrapperAssetName  = "Wrapper.x86_64.latest.zip"
+)
+
+var wrapperReleaseAPIURL = "https://api.github.com/repos/AMDL-Web/wrapper/releases/tags/" + wrapperReleaseTag
+
 func parseStorefrontID(id string) string {
 	sfID, err := strconv.Atoi(strings.Split(id, "-")[0])
 	if err != nil {
@@ -43,26 +50,31 @@ func parseStorefrontID(id string) string {
 	return ""
 }
 
-func PrepareWrapper(mirror bool) {
-	var wrapperZipPath string
-	if runtime.GOARCH == "amd64" {
-		wrapperZipPath = "data/wrapper-x86_64.zip"
-	} else if runtime.GOARCH == "arm64" {
-		wrapperZipPath = "data/wrapper-arm64.zip"
+func PrepareWrapper(mirror bool) error {
+	return prepareWrapper(mirror, runtime.GOARCH)
+}
+
+func prepareWrapper(mirror bool, arch string) error {
+	if arch != "amd64" {
+		return fmt.Errorf("wrapper auto-install only supports x86_64, current architecture is %s", arch)
 	}
+	wrapperZipPath := "data/wrapper-x86_64.zip"
 	if _, err := os.Stat("data/wrapper/wrapper"); os.IsNotExist(err) {
 		if _, err := os.Stat(wrapperZipPath); os.IsNotExist(err) {
-			DownloadWrapperRelease(mirror)
+			if err := DownloadWrapperRelease(mirror); err != nil {
+				return err
+			}
 		}
-		err = unzip.New(wrapperZipPath, "data/wrapper").Extract()
+		err := unzip.New(wrapperZipPath, "data/wrapper").Extract()
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("extract wrapper release: %w", err)
 		}
 		err = os.Chmod("data/wrapper/wrapper", 0777)
 		if err != nil {
-			panic(err)
+			return fmt.Errorf("make wrapper executable: %w", err)
 		}
 	}
+	return nil
 }
 
 func WrapperInitial(account string, password string) {
@@ -234,7 +246,7 @@ func KillWrapper(id string) error {
 }
 
 func provide2FACode(id string, code string) {
-	path := "data/wrapper/rootfs/data/instances/"+id+"/2fa.txt"
+	path := "data/wrapper/rootfs/data/instances/" + id + "/2fa.txt"
 	err := os.WriteFile(path, []byte(code), 0777)
 	if err != nil {
 		log.Warnf("failed to write 2fa.txt: %v", err)
@@ -248,8 +260,68 @@ func RemoveWrapperData(id string) {
 	}
 }
 
-func DownloadWrapperRelease(mirror bool) {
-	panic("Downloading wrapper binary is disabled. Please provide the binary manually in data/wrapper/wrapper.")
+func DownloadWrapperRelease(mirror bool) error {
+	resp, err := GetHttpClient().Get(wrapperReleaseAPIURL)
+	if err != nil {
+		return fmt.Errorf("request wrapper release: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("request wrapper release: %s", resp.Status)
+	}
+
+	var release struct {
+		Assets []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return fmt.Errorf("decode wrapper release: %w", err)
+	}
+
+	var downloadURL string
+	for _, asset := range release.Assets {
+		if asset.Name == wrapperAssetName {
+			downloadURL = asset.BrowserDownloadURL
+			break
+		}
+	}
+	if downloadURL == "" {
+		return fmt.Errorf("wrapper release %s has no %s asset", wrapperReleaseTag, wrapperAssetName)
+	}
+	if mirror {
+		downloadURL = strings.Replace(downloadURL, "github.com", "gh-proxy.com/github.com", 1)
+	}
+
+	wrapperResp, err := GetHttpClient().Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("download wrapper release: %w", err)
+	}
+	defer wrapperResp.Body.Close()
+	if wrapperResp.StatusCode < 200 || wrapperResp.StatusCode >= 300 {
+		return fmt.Errorf("download wrapper release: %s", wrapperResp.Status)
+	}
+	if err := os.MkdirAll("data", 0o755); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
+	temp, err := os.CreateTemp("data", "wrapper-x86_64-*.zip")
+	if err != nil {
+		return fmt.Errorf("create wrapper download: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if _, err := io.Copy(temp, wrapperResp.Body); err != nil {
+		temp.Close()
+		return fmt.Errorf("save wrapper release: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close wrapper release: %w", err)
+	}
+	if err := os.Rename(tempPath, "data/wrapper-x86_64.zip"); err != nil {
+		return fmt.Errorf("finalize wrapper release: %w", err)
+	}
+	return nil
 }
 
 func DownloadStorefrontIds() {
