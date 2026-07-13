@@ -78,25 +78,30 @@ func (s *server) Login(stream grpc.BidiStreamingServer[pb.LoginRequest, pb.Login
 		if err != nil {
 			return err
 		}
-		id := uuid.NewV5(uuid.FromStringOrNil("77777777-7777-7777-7777-77777777"), req.Data.Username).String()
-		for _, instance := range Instances {
-			if instance.Id == id {
-				err = stream.Send(&pb.LoginReply{
-					Header: &pb.ReplyHeader{
-						Code: -1,
-						Msg:  "already login",
-					},
-				})
-				if err != nil {
+		if req.Data.TwoStepCode != "" {
+			pendingID, ok := PendingLoginByAccount.Load(req.Data.Username)
+			if !ok {
+				if err = stream.Send(&pb.LoginReply{Header: &pb.ReplyHeader{Code: -1, Msg: "no pending login"}}); err != nil {
 					return err
 				}
+				continue
 			}
-		}
-		if req.Data.TwoStepCode != "" {
+			id := pendingID.(string)
 			provide2FACode(id, req.Data.TwoStepCode)
 		} else {
-			LoginConnMap.Store(id, stream)
-			go WrapperInitial(req.Data.Username, req.Data.Password)
+			id, idErr := uuid.NewV4()
+			if idErr != nil {
+				return idErr
+			}
+			idString := id.String()
+			if _, loaded := PendingLoginByAccount.LoadOrStore(req.Data.Username, idString); loaded {
+				if err = stream.Send(&pb.LoginReply{Header: &pb.ReplyHeader{Code: -1, Msg: "login already pending"}}); err != nil {
+					return err
+				}
+				continue
+			}
+			LoginConnMap.Store(idString, stream)
+			go WrapperInitial(id, req.Data.Username, req.Data.Password)
 		}
 	}
 }
@@ -108,9 +113,8 @@ func (s *server) Logout(c context.Context, req *pb.LogoutRequest) (*pb.LogoutRep
 	} else {
 		log.Infof("logout request from unknown peer")
 	}
-	id := uuid.NewV5(uuid.FromStringOrNil("77777777-7777-7777-7777-77777777"), req.Data.Username).String()
-	instance := GetInstance(id)
-	if instance.Id == "" {
+	instances := GetInstancesByAccount(req.Data.Username)
+	if len(instances) == 0 {
 		return &pb.LogoutReply{
 			Header: &pb.ReplyHeader{
 				Code: -1,
@@ -119,18 +123,16 @@ func (s *server) Logout(c context.Context, req *pb.LogoutRequest) (*pb.LogoutRep
 			Data: &pb.LogoutData{Username: req.Data.Username},
 		}, nil
 	}
-	instance.NoRestart = true
-	err := KillWrapper(instance.Id)
-	if err != nil {
-		return &pb.LogoutReply{
-			Header: &pb.ReplyHeader{
-				Code: -1,
-				Msg:  "failed to kill wrapper",
-			},
-			Data: &pb.LogoutData{Username: req.Data.Username},
-		}, nil
+	for _, instance := range instances {
+		instance.NoRestart = true
+		if err := KillWrapper(instance.Id); err != nil {
+			return &pb.LogoutReply{
+				Header: &pb.ReplyHeader{Code: -1, Msg: "failed to kill wrapper"},
+				Data:   &pb.LogoutData{Username: req.Data.Username},
+			}, nil
+		}
+		RemoveWrapperData(instance.Id)
 	}
-	RemoveWrapperData(instance.Id)
 	return &pb.LogoutReply{
 		Header: &pb.ReplyHeader{
 			Code: 0,

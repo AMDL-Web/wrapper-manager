@@ -6,6 +6,7 @@ Support linux x86_64 and arm64 arch
 ## Features
 - Multi-instance management
 - Add accounts at runtime (support 2FA)
+- Start multiple Wrapper instances for the same account by logging in again after each instance is ready
 - Multi-connection decryption
 - gRPC API
 - Get lyrics without an account
