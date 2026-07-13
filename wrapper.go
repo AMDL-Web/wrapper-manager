@@ -77,8 +77,7 @@ func prepareWrapper(mirror bool, arch string) error {
 	return nil
 }
 
-func WrapperInitial(account string, password string) {
-	id := uuid.NewV5(uuid.FromStringOrNil("77777777-7777-7777-7777-77777777"), account)
+func WrapperInitial(id uuid.UUID, account string, password string) {
 	err := os.MkdirAll("data/wrapper/rootfs/data/instances/"+id.String(), 0777)
 	if err != nil {
 		panic(err)

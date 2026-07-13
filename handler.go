@@ -8,6 +8,7 @@ import (
 )
 
 var LoginConnMap = sync.Map{}
+var PendingLoginByAccount = sync.Map{}
 
 func Login2FAHandler(id string) {
 	conn, _ := LoginConnMap.Load(id)
@@ -25,6 +26,7 @@ func Login2FAHandler(id string) {
 
 func LoginDoneHandler(id string) {
 	SaveInstances()
+	clearPendingLogin(id)
 	conn, _ := LoginConnMap.LoadAndDelete(id)
 	if conn == nil {
 		return
@@ -43,6 +45,7 @@ func LoginDoneHandler(id string) {
 
 func LoginFailedHandler(id string) {
 	RemoveWrapperData(id)
+	clearPendingLogin(id)
 	conn, _ := LoginConnMap.LoadAndDelete(id)
 	if conn == nil {
 		return
@@ -57,4 +60,14 @@ func LoginFailedHandler(id string) {
 	if err != nil {
 		log.Println(err)
 	}
+}
+
+func clearPendingLogin(id string) {
+	PendingLoginByAccount.Range(func(account, pendingID any) bool {
+		if pendingID == id {
+			PendingLoginByAccount.Delete(account)
+			return false
+		}
+		return true
+	})
 }

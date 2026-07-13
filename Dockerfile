@@ -14,7 +14,7 @@ RUN test "$TARGETARCH" = "amd64" && \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath -ldflags="-s -w" -o /out/wrapper-manager .
 
-FROM ubuntu:24.04
+FROM debian:13.2
 
 WORKDIR /root
 

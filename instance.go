@@ -71,3 +71,13 @@ func GetInstance(id string) *WrapperInstance {
 	}
 	return &WrapperInstance{}
 }
+
+func GetInstancesByAccount(account string) []*WrapperInstance {
+	var matches []*WrapperInstance
+	for _, instance := range Instances {
+		if instance.Account == account {
+			matches = append(matches, instance)
+		}
+	}
+	return matches
+}
