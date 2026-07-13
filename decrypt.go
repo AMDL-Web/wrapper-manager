@@ -14,19 +14,6 @@ type Dispatcher struct {
 	mu        sync.RWMutex
 }
 
-type Task struct {
-	AdamId  string
-	Key     string
-	Payload []byte
-	Result  chan *Result
-}
-
-type Result struct {
-	Success bool
-	Data    []byte
-	Error   error
-}
-
 func NewDispatcher() *Dispatcher {
 	return &Dispatcher{
 		Instances: make([]*DecryptInstance, 0),
@@ -62,17 +49,12 @@ func (d *Dispatcher) RemoveInstance(id string) {
 	}
 }
 
-func (d *Dispatcher) Submit(task *Task) {
-	inst := d.selectInstance(task.AdamId)
+func (d *Dispatcher) OpenSession(adamId, key string) (*DecryptSession, error) {
+	inst := d.selectInstance(adamId)
 	if inst == nil {
-		task.Result <- &Result{
-			Success: false,
-			Data:    task.Payload,
-			Error:   fmt.Errorf("no available instance"),
-		}
-		return
+		return nil, fmt.Errorf("no available instance")
 	}
-	inst.Process(task)
+	return inst.OpenSession(adamId, key)
 }
 
 func (d *Dispatcher) selectInstance(adamId string) *DecryptInstance {

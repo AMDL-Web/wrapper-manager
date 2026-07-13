@@ -18,9 +18,18 @@ const (
 )
 
 type decryptConn struct {
-	conn        net.Conn
-	lastAdamId  string
-	lastKey     string
+	conn       net.Conn
+	lastAdamId string
+	lastKey    string
+}
+
+// DecryptSession leases one wrapper connection for the lifetime of a client
+// gRPC stream. This keeps connection-pool synchronization out of the hot
+// per-sample path.
+type DecryptSession struct {
+	instance *DecryptInstance
+	conn     *decryptConn
+	closed   bool
 }
 
 type DecryptInstance struct {
@@ -54,7 +63,7 @@ func NewDecryptInstance(inst *WrapperInstance) (*DecryptInstance, error) {
 	instance.poolCond = sync.NewCond(&instance.poolMu)
 
 	// Pre-warm with one connection to verify it works
-	conn, err := instance.getOrCreateConn(prefetchKey)
+	conn, err := instance.getOrCreateConn(defaultId, prefetchKey)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +72,7 @@ func NewDecryptInstance(inst *WrapperInstance) (*DecryptInstance, error) {
 	return instance, nil
 }
 
-func (d *DecryptInstance) getOrCreateConn(taskKey string) (*decryptConn, error) {
+func (d *DecryptInstance) getOrCreateConn(adamId, taskKey string) (*decryptConn, error) {
 	d.poolMu.Lock()
 
 	for {
@@ -72,9 +81,10 @@ func (d *DecryptInstance) getOrCreateConn(taskKey string) (*decryptConn, error) 
 			return nil, fmt.Errorf("instance is closed")
 		}
 
-		// 1. Try to find an idle connection with the same key
+		// 1. Try to find an idle connection with the same song and key.
+		// Key URIs are not guaranteed to identify a song by themselves.
 		for i, c := range d.pool {
-			if c.lastKey == taskKey {
+			if c.lastAdamId == adamId && c.lastKey == taskKey {
 				// Remove from pool
 				d.pool = append(d.pool[:i], d.pool[i+1:]...)
 				d.poolMu.Unlock()
@@ -172,61 +182,65 @@ func (d *DecryptInstance) GetLastHandleTime() time.Time {
 	return d.LastHandleTime
 }
 
-func (d *DecryptInstance) Process(task *Task) {
+func (d *DecryptInstance) OpenSession(adamId, key string) (*DecryptSession, error) {
 	d.stateMu.Lock()
 	d.LastHandleTime = time.Now()
 	d.stateMu.Unlock()
 
-	c, err := d.getOrCreateConn(task.Key)
+	c, err := d.getOrCreateConn(adamId, key)
 	if err != nil {
-		d.Unavailable()
-		task.Result <- &Result{
-			Success: false,
-			Data:    task.Payload,
-			Error:   err,
-		}
-		return
+		return nil, err
+	}
+	return &DecryptSession{instance: d, conn: c}, nil
+}
+
+func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, error) {
+	if s.closed || s.conn == nil {
+		return nil, fmt.Errorf("decrypt session is closed")
 	}
 
-	if c.lastKey == "" || c.lastKey != task.Key {
-		err := d.switchConnContext(c, task.AdamId, task.Key)
+	s.instance.stateMu.Lock()
+	s.instance.LastHandleTime = time.Now()
+	s.instance.stateMu.Unlock()
+
+	if s.conn.lastAdamId != adamId || s.conn.lastKey != key {
+		err := s.instance.switchConnContext(s.conn, adamId, key)
 		if err != nil {
-			d.discardConn(c)
-			d.Unavailable()
-			task.Result <- &Result{
-				Success: false,
-				Data:    task.Payload,
-				Error:   err,
-			}
-			return
+			s.Discard()
+			return nil, err
 		}
 	}
 
-	result, err := d.decryptConn(c, task.Payload)
+	result, err := s.instance.decryptConn(s.conn, payload)
 	if err != nil {
-		d.discardConn(c)
-		d.Unavailable()
-		task.Result <- &Result{
-			Success: false,
-			Data:    task.Payload,
-			Error:   err,
-		}
-		return
+		s.Discard()
+		return nil, err
 	}
 
 	// Update global instance keys for heuristic status
-	d.stateMu.Lock()
-	d.LastAdamId = task.AdamId
-	d.LastKey = task.Key
-	d.stateMu.Unlock()
+	s.instance.stateMu.Lock()
+	s.instance.LastAdamId = adamId
+	s.instance.LastKey = key
+	s.instance.stateMu.Unlock()
+	return result, nil
+}
 
-	d.releaseConn(c)
-
-	task.Result <- &Result{
-		Success: true,
-		Data:    result,
-		Error:   nil,
+func (s *DecryptSession) Close() {
+	if s.closed {
+		return
 	}
+	s.closed = true
+	s.instance.releaseConn(s.conn)
+	s.conn = nil
+}
+
+func (s *DecryptSession) Discard() {
+	if s.closed {
+		return
+	}
+	s.closed = true
+	s.instance.discardConn(s.conn)
+	s.conn = nil
 }
 
 func (d *DecryptInstance) decryptConn(c *decryptConn, sample []byte) ([]byte, error) {
