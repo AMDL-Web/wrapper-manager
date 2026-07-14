@@ -1,4 +1,4 @@
-name: Build amd64 Docker image
+name: Build multi-arch Docker image
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: wrapper-manager-amd64-${{ github.ref }}
+  group: wrapper-manager-multiarch-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -45,11 +45,11 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
 
-      - name: Build and publish amd64 image
+      - name: Build and publish multi-arch image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -10,8 +10,7 @@ COPY proto/go.mod proto/go.sum ./proto/
 RUN go mod download
 
 COPY . .
-RUN test "$TARGETARCH" = "amd64" && \
-    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath -ldflags="-s -w" -o /out/wrapper-manager .
 
 FROM debian:13.2
