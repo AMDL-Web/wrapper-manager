@@ -16,12 +16,32 @@ import (
 	"strings"
 )
 
-const (
-	wrapperReleaseTag = "wrapper.x86_64.latest"
-	wrapperAssetName  = "Wrapper.x86_64.latest.zip"
-)
+type wrapperRelease struct {
+	tag         string
+	assetName   string
+	archivePath string
+}
 
-var wrapperReleaseAPIURL = "https://api.github.com/repos/AMDL-Web/wrapper/releases/tags/" + wrapperReleaseTag
+var wrapperReleaseAPIBaseURL = "https://api.github.com/repos/AMDL-Web/wrapper/releases/tags/"
+
+func wrapperReleaseForArch(arch string) (wrapperRelease, error) {
+	switch arch {
+	case "amd64":
+		return wrapperRelease{
+			tag:         "wrapper.x86_64.latest",
+			assetName:   "Wrapper.x86_64.latest.zip",
+			archivePath: "data/wrapper-x86_64.zip",
+		}, nil
+	case "arm64":
+		return wrapperRelease{
+			tag:         "wrapper.arm64.latest",
+			assetName:   "Wrapper.arm64.latest.zip",
+			archivePath: "data/wrapper-arm64.zip",
+		}, nil
+	default:
+		return wrapperRelease{}, fmt.Errorf("wrapper auto-install only supports amd64 and arm64, current architecture is %s", arch)
+	}
+}
 
 func parseStorefrontID(id string) string {
 	sfID, err := strconv.Atoi(strings.Split(id, "-")[0])
@@ -55,17 +75,17 @@ func PrepareWrapper(mirror bool) error {
 }
 
 func prepareWrapper(mirror bool, arch string) error {
-	if arch != "amd64" {
-		return fmt.Errorf("wrapper auto-install only supports x86_64, current architecture is %s", arch)
+	release, err := wrapperReleaseForArch(arch)
+	if err != nil {
+		return err
 	}
-	wrapperZipPath := "data/wrapper-x86_64.zip"
 	if _, err := os.Stat("data/wrapper/wrapper"); os.IsNotExist(err) {
-		if _, err := os.Stat(wrapperZipPath); os.IsNotExist(err) {
-			if err := DownloadWrapperRelease(mirror); err != nil {
+		if _, err := os.Stat(release.archivePath); os.IsNotExist(err) {
+			if err := downloadWrapperRelease(mirror, release); err != nil {
 				return err
 			}
 		}
-		err := unzip.New(wrapperZipPath, "data/wrapper").Extract()
+		err := unzip.New(release.archivePath, "data/wrapper").Extract()
 		if err != nil {
 			return fmt.Errorf("extract wrapper release: %w", err)
 		}
@@ -260,7 +280,15 @@ func RemoveWrapperData(id string) {
 }
 
 func DownloadWrapperRelease(mirror bool) error {
-	resp, err := GetHttpClient().Get(wrapperReleaseAPIURL)
+	release, err := wrapperReleaseForArch(runtime.GOARCH)
+	if err != nil {
+		return err
+	}
+	return downloadWrapperRelease(mirror, release)
+}
+
+func downloadWrapperRelease(mirror bool, expected wrapperRelease) error {
+	resp, err := GetHttpClient().Get(wrapperReleaseAPIBaseURL + expected.tag)
 	if err != nil {
 		return fmt.Errorf("request wrapper release: %w", err)
 	}
@@ -281,13 +309,13 @@ func DownloadWrapperRelease(mirror bool) error {
 
 	var downloadURL string
 	for _, asset := range release.Assets {
-		if asset.Name == wrapperAssetName {
+		if asset.Name == expected.assetName {
 			downloadURL = asset.BrowserDownloadURL
 			break
 		}
 	}
 	if downloadURL == "" {
-		return fmt.Errorf("wrapper release %s has no %s asset", wrapperReleaseTag, wrapperAssetName)
+		return fmt.Errorf("wrapper release %s has no %s asset", expected.tag, expected.assetName)
 	}
 	if mirror {
 		downloadURL = strings.Replace(downloadURL, "github.com", "gh-proxy.com/github.com", 1)
@@ -304,7 +332,7 @@ func DownloadWrapperRelease(mirror bool) error {
 	if err := os.MkdirAll("data", 0o755); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
-	temp, err := os.CreateTemp("data", "wrapper-x86_64-*.zip")
+	temp, err := os.CreateTemp("data", "wrapper-*.zip")
 	if err != nil {
 		return fmt.Errorf("create wrapper download: %w", err)
 	}
@@ -317,7 +345,7 @@ func DownloadWrapperRelease(mirror bool) error {
 	if err := temp.Close(); err != nil {
 		return fmt.Errorf("close wrapper release: %w", err)
 	}
-	if err := os.Rename(tempPath, "data/wrapper-x86_64.zip"); err != nil {
+	if err := os.Rename(tempPath, expected.archivePath); err != nil {
 		return fmt.Errorf("finalize wrapper release: %w", err)
 	}
 	return nil
