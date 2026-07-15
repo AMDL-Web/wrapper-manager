@@ -1,97 +1,244 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"github.com/sirupsen/logrus"
-	"math/rand"
+	"sort"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 )
 
 var WMDispatcher *Dispatcher
 
+type regionAvailabilityFunc func(context.Context, string, string, bool) (bool, error)
+
 type Dispatcher struct {
-	Instances []*DecryptInstance
-	mu        sync.RWMutex
+	Instances   []*DecryptInstance
+	mu          sync.RWMutex
+	generation  map[string]uint64
+	newInstance func(*WrapperInstance) (*DecryptInstance, error)
+
+	selectionMu sync.Mutex
+	roundRobin  uint64
+
+	notifyMu   sync.Mutex
+	capacityCh chan struct{}
+
+	checkRegion regionAvailabilityFunc
 }
 
 func NewDispatcher() *Dispatcher {
 	return &Dispatcher{
-		Instances: make([]*DecryptInstance, 0),
-		mu:        sync.RWMutex{},
+		Instances:   make([]*DecryptInstance, 0),
+		generation:  make(map[string]uint64),
+		newInstance: NewDecryptInstance,
+		capacityCh:  make(chan struct{}),
+		checkRegion: checkAvailableOnRegionContext,
 	}
+}
+
+func (d *Dispatcher) signalCapacity() {
+	d.notifyMu.Lock()
+	close(d.capacityCh)
+	d.capacityCh = make(chan struct{})
+	d.notifyMu.Unlock()
+}
+
+func (d *Dispatcher) capacitySignal() <-chan struct{} {
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	return d.capacityCh
 }
 
 func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	decryptInstance, err := NewDecryptInstance(inst)
+	d.generation[inst.Id]++
+	generation := d.generation[inst.Id]
+	d.mu.Unlock()
+
+	// Pre-warming performs wrapper I/O and must not block dispatch or lifecycle
+	// operations for existing instances.
+	decryptInstance, err := d.newInstance(inst)
 	if err != nil {
 		logrus.Errorf("failed to add instance %s: %s", inst.Id, err)
-	}
-	d.Instances = append(d.Instances, decryptInstance)
-	logrus.Debugf("added instance %s", inst.Id)
-}
-
-func (d *Dispatcher) RemoveInstance(id string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.Instances) == 0 {
 		return
 	}
-	for i, inst := range d.Instances {
-		if inst == nil {
-			continue
-		}
-		if inst.id == id {
+	decryptInstance.onCapacity = d.signalCapacity
+
+	var replaced *DecryptInstance
+	d.mu.Lock()
+	if d.generation[inst.Id] != generation {
+		d.mu.Unlock()
+		decryptInstance.Close()
+		return
+	}
+	for i, current := range d.Instances {
+		if current != nil && current.id == inst.Id {
+			replaced = current
 			d.Instances = append(d.Instances[:i], d.Instances[i+1:]...)
 			break
 		}
 	}
-}
-
-func (d *Dispatcher) OpenSession(adamId, key string) (*DecryptSession, error) {
-	inst := d.selectInstance(adamId)
-	if inst == nil {
-		return nil, fmt.Errorf("no available instance")
+	d.Instances = append(d.Instances, decryptInstance)
+	d.mu.Unlock()
+	if replaced != nil {
+		replaced.Close()
 	}
-	return inst.OpenSession(adamId, key)
+	d.signalCapacity()
+	logrus.Debugf("added instance %s", inst.Id)
 }
 
-func (d *Dispatcher) selectInstance(adamId string) *DecryptInstance {
+func (d *Dispatcher) RemoveInstance(id string) {
+	var removed *DecryptInstance
+	d.mu.Lock()
+	d.generation[id]++
+	for i, inst := range d.Instances {
+		if inst != nil && inst.id == id {
+			removed = inst
+			d.Instances = append(d.Instances[:i], d.Instances[i+1:]...)
+			break
+		}
+	}
+	d.mu.Unlock()
+	if removed != nil {
+		removed.Close()
+		d.signalCapacity()
+	}
+}
+
+func (d *Dispatcher) snapshotInstances() []*DecryptInstance {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	return append([]*DecryptInstance(nil), d.Instances...)
+}
 
-	if len(d.Instances) == 0 {
-		return nil
+func (d *Dispatcher) availableInstances(ctx context.Context, adamId string, instances []*DecryptInstance) ([]*DecryptInstance, error) {
+	availability := make(map[string]bool)
+	checked := make(map[string]bool)
+	var firstErr error
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		if checked[inst.region] {
+			continue
+		}
+		checked[inst.region] = true
+		ok, err := d.checkRegion(ctx, adamId, inst.region, false)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		availability[inst.region] = ok
 	}
 
-	for _, inst := range d.Instances {
-		if inst.GetLastAdamId() == adamId {
-			// logrus.Debugf("selected instance %s for adamid %s, method 1", inst.id, adamId)
-			return inst
+	result := make([]*DecryptInstance, 0, len(instances))
+	for _, inst := range instances {
+		if inst != nil && availability[inst.region] {
+			result = append(result, inst)
 		}
 	}
-
-	for _, inst := range d.Instances {
-		ok, _ := checkAvailableOnRegion(adamId, inst.region, false)
-		if inst.GetLastAdamId() == "" && ok {
-			// logrus.Debugf("selected instance %s for adamid %s, method 2", inst.id, adamId)
-			return inst
-		}
+	if len(result) == 0 && firstErr != nil {
+		return nil, firstErr
 	}
+	return result, nil
+}
 
-	var candidates []*DecryptInstance
+type instanceCandidate struct {
+	instance *DecryptInstance
+	load     instanceLoad
+	tieOrder uint64
+}
 
-	for _, inst := range d.Instances {
-		ok, _ := checkAvailableOnRegion(adamId, inst.region, false)
+func (d *Dispatcher) reserveBest(instances []*DecryptInstance, adamId, key string, skipped map[*DecryptInstance]bool) (*DecryptInstance, *decryptConn, bool) {
+	d.selectionMu.Lock()
+	defer d.selectionMu.Unlock()
+
+	candidates := make([]instanceCandidate, 0, len(instances))
+	start := d.roundRobin
+	for i, inst := range instances {
+		if skipped[inst] {
+			continue
+		}
+		load := inst.snapshotLoad(adamId, key)
+		if !load.hasCapacity {
+			continue
+		}
+		candidates = append(candidates, instanceCandidate{
+			instance: inst,
+			load:     load,
+			tieOrder: (uint64(i) + uint64(len(instances)) - start%uint64(len(instances))) % uint64(len(instances)),
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].load.inUse != candidates[j].load.inUse {
+			return candidates[i].load.inUse < candidates[j].load.inUse
+		}
+		if candidates[i].load.contextHit != candidates[j].load.contextHit {
+			return candidates[i].load.contextHit
+		}
+		return candidates[i].tieOrder < candidates[j].tieOrder
+	})
+
+	for _, candidate := range candidates {
+		conn, needsDial, ok := candidate.instance.reserveConn(adamId, key)
 		if ok {
-			candidates = append(candidates, inst)
+			d.roundRobin++
+			return candidate.instance, conn, needsDial
 		}
 	}
+	return nil, nil, false
+}
 
-	if len(candidates) > 0 {
-		return candidates[rand.Intn(len(candidates))]
+func (d *Dispatcher) OpenSession(ctx context.Context, adamId, key string) (*DecryptSession, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	for {
+		// Capture the notification before checking capacity so a release between
+		// the check and wait cannot be missed.
+		capacityCh := d.capacitySignal()
+		instances := d.snapshotInstances()
+		if len(instances) == 0 {
+			return nil, errors.New("no available instance")
+		}
+		available, err := d.availableInstances(ctx, adamId, instances)
+		if err != nil {
+			return nil, err
+		}
+		if len(available) == 0 {
+			return nil, fmt.Errorf("no available instance")
+		}
 
-	return nil
+		skipped := make(map[*DecryptInstance]bool, len(available))
+		var lastDialErr error
+		for len(skipped) < len(available) {
+			inst, conn, needsDial := d.reserveBest(available, adamId, key, skipped)
+			if inst == nil {
+				break
+			}
+			session, openErr := inst.openReserved(ctx, conn, needsDial)
+			if openErr == nil {
+				return session, nil
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastDialErr = openErr
+			skipped[inst] = true
+		}
+		if lastDialErr != nil && len(skipped) == len(available) {
+			return nil, lastDialErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-capacityCh:
+		}
+	}
 }

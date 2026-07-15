@@ -31,6 +31,22 @@ type server struct {
 	pb.UnimplementedWrapperManagerServiceServer
 }
 
+type decryptReplyEnvelope struct {
+	reply pb.DecryptReply
+	data  pb.DecryptData
+}
+
+func newDecryptSuccessReply(header *pb.ReplyHeader, adamID, key string, sampleIndex int32, sample []byte) *pb.DecryptReply {
+	envelope := &decryptReplyEnvelope{}
+	envelope.reply.Header = header
+	envelope.reply.Data = &envelope.data
+	envelope.data.AdamId = adamID
+	envelope.data.Key = key
+	envelope.data.SampleIndex = sampleIndex
+	envelope.data.Sample = sample
+	return &envelope.reply
+}
+
 func (s *server) Status(c context.Context, req *emptypb.Empty) (*pb.StatusReply, error) {
 	p, ok := peer.FromContext(c)
 	if ok {
@@ -151,6 +167,7 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 	}
 	var session *DecryptSession
 	var sessionAdamId string
+	successHeader := &pb.ReplyHeader{Code: 0, Msg: "SUCCESS"}
 	defer func() {
 		if session != nil {
 			session.Close()
@@ -165,25 +182,27 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 		if err != nil {
 			return err
 		}
+		if req == nil || req.Data == nil {
+			if err := stream.Send(&pb.DecryptReply{Header: &pb.ReplyHeader{Code: -1, Msg: "missing decrypt data"}}); err != nil {
+				return err
+			}
+			continue
+		}
 		if req.Data.AdamId == "KEEPALIVE" {
-			_ = stream.Send(&pb.DecryptReply{
-				Header: &pb.ReplyHeader{
-					Code: 0,
-					Msg:  "SUCCESS",
-				},
-				Data: &pb.DecryptData{
-					AdamId: "KEEPALIVE",
-				},
-			})
+			if err := stream.Send(newDecryptSuccessReply(successHeader, "KEEPALIVE", "", 0, nil)); err != nil {
+				return err
+			}
 			continue
 		}
 		if session == nil || sessionAdamId != req.Data.AdamId {
 			if session != nil {
 				session.Close()
 			}
-			session, err = WMDispatcher.OpenSession(req.Data.AdamId, req.Data.Key)
+			session, err = WMDispatcher.OpenSession(stream.Context(), req.Data.AdamId, req.Data.Key)
 			if err != nil {
-				_ = stream.Send(decryptErrorReply(req.Data, err))
+				if sendErr := stream.Send(decryptErrorReply(req.Data, err)); sendErr != nil {
+					return sendErr
+				}
 				session = nil
 				continue
 			}
@@ -192,7 +211,7 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 
 		result, decryptErr := session.Decrypt(req.Data.AdamId, req.Data.Key, req.Data.Sample)
 		if decryptErr != nil {
-			_ = stream.Send(&pb.DecryptReply{
+			if err := stream.Send(&pb.DecryptReply{
 				Header: &pb.ReplyHeader{
 					Code: -1,
 					Msg:  decryptErr.Error(),
@@ -200,24 +219,22 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 				Data: &pb.DecryptData{
 					AdamId:      req.Data.AdamId,
 					Key:         req.Data.Key,
-					Sample:      req.Data.Sample,
 					SampleIndex: req.Data.SampleIndex,
 				},
-			})
+			}); err != nil {
+				return err
+			}
 			session = nil // Decrypt discarded the failed connection.
 		} else {
-			_ = stream.Send(&pb.DecryptReply{
-				Header: &pb.ReplyHeader{
-					Code: 0,
-					Msg:  "SUCCESS",
-				},
-				Data: &pb.DecryptData{
-					AdamId:      req.Data.AdamId,
-					Key:         req.Data.Key,
-					SampleIndex: req.Data.SampleIndex,
-					Sample:      result,
-				},
-			})
+			if err := stream.Send(newDecryptSuccessReply(
+				successHeader,
+				req.Data.AdamId,
+				req.Data.Key,
+				req.Data.SampleIndex,
+				result,
+			)); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -552,6 +569,11 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 	var opts []grpc.ServerOption
+	codec, err := newManagerCodec()
+	if err != nil {
+		log.Fatalf("failed to initialize gRPC codec: %v", err)
+	}
+	opts = append(opts, grpc.ForceServerCodecV2(codec))
 	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterWrapperManagerServiceServer(grpcServer, newServer())
 	reflection.Register(grpcServer)

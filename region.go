@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"golang.org/x/sync/singleflight"
 	"io"
 	"math/rand"
 	"net/http"
 	"sync"
+	"time"
 )
+
+const regionRequestTimeout = 15 * time.Second
 
 var (
 	SongRegionCache        sync.Map
@@ -16,6 +21,10 @@ var (
 )
 
 func checkAvailableOnRegion(adamId string, region string, mv bool) (bool, error) {
+	return checkAvailableOnRegionContext(context.Background(), adamId, region, mv)
+}
+
+func checkAvailableOnRegionContext(ctx context.Context, adamId string, region string, mv bool) (bool, error) {
 	var cacheKey string
 	if mv {
 		cacheKey = fmt.Sprintf("mv/%s/%s", region, adamId)
@@ -26,7 +35,7 @@ func checkAvailableOnRegion(adamId string, region string, mv bool) (bool, error)
 		return result.(bool), nil
 	}
 
-	val, err, _ := songRegionSingleFlight.Do(cacheKey, func() (interface{}, error) {
+	resultCh := songRegionSingleFlight.DoChan(cacheKey, func() (interface{}, error) {
 		if adamId == "0" {
 			return true, nil
 		}
@@ -41,7 +50,11 @@ func checkAvailableOnRegion(adamId string, region string, mv bool) (bool, error)
 		if err != nil {
 			return false, err
 		}
-		req, err := http.NewRequest("GET", url, nil)
+		// The shared request must not inherit the first caller's cancellation:
+		// other streams for the same song may still be waiting on this flight.
+		requestCtx, cancel := context.WithTimeout(context.Background(), regionRequestTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(requestCtx, "GET", url, nil)
 		if err != nil {
 			return false, err
 		}
@@ -53,6 +66,7 @@ func checkAvailableOnRegion(adamId string, region string, mv bool) (bool, error)
 		if err != nil {
 			return false, err
 		}
+		defer resp.Body.Close()
 
 		respBody, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -72,7 +86,23 @@ func checkAvailableOnRegion(adamId string, region string, mv bool) (bool, error)
 		return available, nil
 	})
 
-	return val.(bool), err
+	var val interface{}
+	var err error
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case result := <-resultCh:
+		val, err = result.Val, result.Err
+	}
+
+	if err != nil {
+		return false, err
+	}
+	available, ok := val.(bool)
+	if !ok {
+		return false, errors.New("unexpected region availability result")
+	}
+	return available, nil
 }
 
 func SelectInstance(adamId string) (string, error) {
