@@ -66,6 +66,7 @@ func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 		return
 	}
 	decryptInstance.onCapacity = d.signalCapacity
+	decryptInstance.onUnavailable = d.quarantineInstance
 
 	var replaced *DecryptInstance
 	d.mu.Lock()
@@ -88,6 +89,26 @@ func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 	}
 	d.signalCapacity()
 	logrus.Debugf("added instance %s", inst.Id)
+}
+
+func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
+	if target == nil {
+		return
+	}
+	removed := false
+	d.mu.Lock()
+	for i, current := range d.Instances {
+		if current == target {
+			d.generation[target.id]++
+			d.Instances = append(d.Instances[:i], d.Instances[i+1:]...)
+			removed = true
+			break
+		}
+	}
+	d.mu.Unlock()
+	if removed {
+		d.signalCapacity()
+	}
 }
 
 func (d *Dispatcher) RemoveInstance(id string) {

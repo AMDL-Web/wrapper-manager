@@ -14,10 +14,14 @@ import (
 )
 
 const (
-	defaultId        = "0"
-	prefetchKey      = "skd://itunes.apple.com/P000000000/s1/e1"
-	decryptIOTimeout = 30 * time.Second
-	maxPoolSize      = 10
+	defaultId                = "0"
+	prefetchKey              = "skd://itunes.apple.com/P000000000/s1/e1"
+	decryptIOTimeout         = 30 * time.Second
+	maxPoolSize              = 10
+	wrapperFailureWindow     = 60 * time.Second
+	wrapperFailureThreshold  = 3
+	wrapperFailureMinConns   = 3
+	wrapperFailureMinAdamIDs = 2
 )
 
 var errInstanceBusy = errors.New("decrypt instance is at capacity")
@@ -31,6 +35,12 @@ type decryptConn struct {
 	writeHeader  [4]byte
 	writeParts   [2][]byte
 	writeBuffers net.Buffers
+}
+
+type wrapperIOFailure struct {
+	at     time.Time
+	conn   *decryptConn
+	adamID string
 }
 
 // DecryptSession leases one wrapper connection for the lifetime of a client
@@ -56,30 +66,39 @@ type DecryptInstance struct {
 	region      string
 	decryptPort int
 
-	poolMu      sync.Mutex
-	pool        []*decryptConn
-	connections map[*decryptConn]struct{}
-	reserved    int
-	isClosed    bool
-	poolLimit   int
-	dialContext dialContextFunc
-	ioTimeout   time.Duration
-	onCapacity  func()
+	poolMu           sync.Mutex
+	pool             []*decryptConn
+	connections      map[*decryptConn]struct{}
+	reserved         int
+	isClosed         bool
+	poolLimit        int
+	dialContext      dialContextFunc
+	ioTimeout        time.Duration
+	onCapacity       func()
+	onUnavailable    func(*DecryptInstance, string)
+	terminateWrapper func() error
+	now              func() time.Time
 
-	closeOnce sync.Once
+	healthMu sync.Mutex
+	failures []wrapperIOFailure
+
+	closeOnce       sync.Once
+	unavailableOnce sync.Once
 }
 
 func NewDecryptInstance(inst *WrapperInstance) (*DecryptInstance, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	instance := &DecryptInstance{
-		id:          inst.Id,
-		region:      inst.Region,
-		decryptPort: inst.DecryptPort,
-		pool:        make([]*decryptConn, 0, maxPoolSize),
-		connections: make(map[*decryptConn]struct{}, maxPoolSize),
-		poolLimit:   maxPoolSize,
-		dialContext: dialer.DialContext,
-		ioTimeout:   decryptIOTimeout,
+		id:               inst.Id,
+		region:           inst.Region,
+		decryptPort:      inst.DecryptPort,
+		pool:             make([]*decryptConn, 0, maxPoolSize),
+		connections:      make(map[*decryptConn]struct{}, maxPoolSize),
+		poolLimit:        maxPoolSize,
+		dialContext:      dialer.DialContext,
+		ioTimeout:        decryptIOTimeout,
+		terminateWrapper: func() error { return terminateWrapperInstance(inst, wrapperTerminateGrace) },
+		now:              time.Now,
 	}
 
 	// Pre-warm one connection both to validate the wrapper and to keep the
@@ -271,11 +290,28 @@ func (d *DecryptInstance) Close() {
 	})
 }
 
-func (d *DecryptInstance) Unavailable() {
-	d.Close()
-	if err := KillWrapper(d.id); err != nil {
-		logrus.Errorf("failed to kill instance %s: %s", d.id, err)
-	}
+func (d *DecryptInstance) Unavailable(reason string) {
+	d.unavailableOnce.Do(func() {
+		// Closing first immediately removes this instance from scheduling and
+		// interrupts every leased connection. The wrapper lifecycle will replace
+		// the process and register a fresh DecryptInstance after it exits.
+		d.Close()
+		logrus.Warnf("wrapper instance %s is unhealthy: %s; restarting", d.id, reason)
+		if d.onUnavailable != nil {
+			d.onUnavailable(d, reason)
+		}
+		if d.terminateWrapper == nil {
+			logrus.Errorf("failed to restart instance %s: no wrapper kill function", d.id)
+			return
+		}
+		// Process termination may wait for a grace period. It must not delay the
+		// failed decrypt response or hold up healthy instances in the dispatcher.
+		go func() {
+			if err := d.terminateWrapper(); err != nil {
+				logrus.Errorf("failed to terminate instance %s: %s", d.id, err)
+			}
+		}()
+	})
 }
 
 func (s *DecryptSession) currentConn() (*decryptConn, error) {
@@ -298,6 +334,7 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	}
 	if c.lastAdamId != adamId || c.lastKey != key {
 		if err := s.instance.switchConnContext(s.ctx, c, adamId, key); err != nil {
+			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", err)
 			s.Discard()
 			return nil, mapContextError(s.ctx, err)
 		}
@@ -307,10 +344,94 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	// The slice is sent once and is never modified by a later request.
 	result, err := s.instance.decryptConn(s.ctx, c, payload, payload)
 	if err != nil {
+		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "decrypt", err)
 		s.Discard()
 		return nil, mapContextError(s.ctx, err)
 	}
 	return result, nil
+}
+
+func classifyLocalWrapperIOError(ctx context.Context, err error) (local, timedOut bool) {
+	if err == nil {
+		return false, false
+	}
+	// A client cancellation or client-owned deadline is not evidence that the
+	// local wrapper process is unhealthy.
+	if ctx != nil && ctx.Err() != nil {
+		return false, false
+	}
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return false, false
+		}
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true, false
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) {
+		return false, false
+	}
+	return true, netErr.Timeout()
+}
+
+func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, err error) {
+	local, timedOut := classifyLocalWrapperIOError(ctx, err)
+	if conn == nil || adamID == "" || !local {
+		return
+	}
+	d.poolMu.Lock()
+	closed := d.isClosed
+	d.poolMu.Unlock()
+	if closed {
+		return
+	}
+	// The deadline owned by this manager is thirty seconds. A loopback wrapper
+	// operation exceeding it is already conclusive evidence of a wedged local
+	// process; waiting for more timeouts only prolongs the outage, especially at
+	// concurrency one.
+	if timedOut {
+		d.Unavailable(fmt.Sprintf("local %s I/O timed out for Adam ID %s", stage, adamID))
+		return
+	}
+
+	now := time.Now()
+	if d.now != nil {
+		now = d.now()
+	}
+	cutoff := now.Add(-wrapperFailureWindow)
+
+	d.healthMu.Lock()
+	kept := d.failures[:0]
+	for _, failure := range d.failures {
+		if !failure.at.Before(cutoff) {
+			kept = append(kept, failure)
+		}
+	}
+	d.failures = append(kept, wrapperIOFailure{
+		at:     now,
+		conn:   conn,
+		adamID: adamID,
+	})
+
+	connections := make(map[*decryptConn]struct{}, len(d.failures))
+	adamIDs := make(map[string]struct{}, len(d.failures))
+	for _, failure := range d.failures {
+		connections[failure.conn] = struct{}{}
+		adamIDs[failure.adamID] = struct{}{}
+	}
+	failureCount := len(d.failures)
+	shouldTrip := failureCount >= wrapperFailureThreshold && len(connections) >= wrapperFailureMinConns && len(adamIDs) >= wrapperFailureMinAdamIDs
+	d.healthMu.Unlock()
+
+	if !shouldTrip {
+		logrus.Warnf("wrapper instance %s local %s I/O failure (%d/%d in %s): %v", d.id, stage, failureCount, wrapperFailureThreshold, wrapperFailureWindow, err)
+		return
+	}
+	d.Unavailable(fmt.Sprintf(
+		"%d local I/O failures across %d connections and %d Adam IDs in %s",
+		failureCount, len(connections), len(adamIDs), wrapperFailureWindow,
+	))
 }
 
 func mapContextError(ctx context.Context, err error) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -21,6 +22,12 @@ type fakeDecryptServer struct {
 	mu         sync.Mutex
 	conns      map[net.Conn]struct{}
 }
+
+type fakeTimeoutError struct{}
+
+func (fakeTimeoutError) Error() string   { return "i/o timeout" }
+func (fakeTimeoutError) Timeout() bool   { return true }
+func (fakeTimeoutError) Temporary() bool { return true }
 
 func newFakeDecryptServer(t *testing.T) *fakeDecryptServer {
 	t.Helper()
@@ -370,6 +377,166 @@ func TestDecryptCancellationWithoutDeadlineInterruptsBlockedWrapperIO(t *testing
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("blocked I/O did not stop after context cancellation")
+	}
+}
+
+func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
+	server := newFakeDecryptServer(t)
+	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.ioTimeout = 30 * time.Millisecond
+	terminated := make(chan struct{}, 2)
+	instance.terminateWrapper = func() error {
+		terminated <- struct{}{}
+		return nil
+	}
+
+	session, err := instance.OpenSession(context.Background(), "song-1", "key-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Decrypt("song-1", "key-1", []byte("block")); err == nil {
+		t.Fatal("expected wrapper I/O timeout")
+	}
+	select {
+	case <-terminated:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wrapper termination")
+	}
+	instance.Unavailable("duplicate trigger")
+	select {
+	case <-terminated:
+		t.Fatal("wrapper termination ran more than once")
+	case <-time.After(50 * time.Millisecond):
+	}
+	instance.poolMu.Lock()
+	defer instance.poolMu.Unlock()
+	if !instance.isClosed || len(instance.connections) != 0 || len(instance.pool) != 0 {
+		t.Fatalf("unhealthy instance was not quarantined: closed=%v connections=%d pool=%d", instance.isClosed, len(instance.connections), len(instance.pool))
+	}
+}
+
+func TestConcurrentWrapperIOTimeoutsScheduleSingleTermination(t *testing.T) {
+	instance := &DecryptInstance{
+		id:          "test",
+		connections: make(map[*decryptConn]struct{}),
+		poolLimit:   maxPoolSize,
+	}
+	var terminations atomic.Int32
+	terminationStarted := make(chan struct{})
+	releaseTermination := make(chan struct{})
+	instance.terminateWrapper = func() error {
+		if terminations.Add(1) == 1 {
+			close(terminationStarted)
+		}
+		<-releaseTermination
+		return nil
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < maxPoolSize; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			instance.observeWrapperIOFailure(
+				context.Background(),
+				&decryptConn{},
+				fmt.Sprintf("song-%d", i),
+				"decrypt",
+				fakeTimeoutError{},
+			)
+		}(i)
+	}
+	close(start)
+	returned := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(returned)
+	}()
+	select {
+	case <-terminationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("wrapper termination did not start")
+	}
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("failure reporters blocked on wrapper termination")
+	}
+	if got := terminations.Load(); got != 1 {
+		t.Fatalf("wrapper terminations = %d, want 1", got)
+	}
+	close(releaseTermination)
+}
+
+func TestClientDeadlineDoesNotQuarantineWrapper(t *testing.T) {
+	server := newFakeDecryptServer(t)
+	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.ioTimeout = time.Second
+	var terminations atomic.Int32
+	instance.terminateWrapper = func() error {
+		terminations.Add(1)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	session, err := instance.OpenSession(ctx, "song-1", "key-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Decrypt("song-1", "key-1", []byte("block")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Decrypt error = %v, want deadline exceeded", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := terminations.Load(); got != 0 {
+		t.Fatalf("client deadline triggered %d wrapper terminations", got)
+	}
+	instance.poolMu.Lock()
+	defer instance.poolMu.Unlock()
+	if instance.isClosed {
+		t.Fatal("client deadline quarantined wrapper instance")
+	}
+}
+
+func TestRepeatedConnectionFailuresAcrossSongsQuarantineOnce(t *testing.T) {
+	instance := &DecryptInstance{
+		id:          "test",
+		connections: make(map[*decryptConn]struct{}),
+		poolLimit:   maxPoolSize,
+		now:         time.Now,
+	}
+	terminated := make(chan struct{}, 2)
+	instance.terminateWrapper = func() error {
+		terminated <- struct{}{}
+		return nil
+	}
+	for i, adamID := range []string{"song-1", "song-1", "song-2"} {
+		instance.observeWrapperIOFailure(context.Background(), &decryptConn{}, adamID, "decrypt", io.EOF)
+		if i < 2 {
+			select {
+			case <-terminated:
+				t.Fatalf("wrapper terminated after only %d connection failures", i+1)
+			default:
+			}
+		}
+	}
+	select {
+	case <-terminated:
+	case <-time.After(time.Second):
+		t.Fatal("repeated cross-song connection failures did not terminate wrapper")
+	}
+	instance.Unavailable("duplicate trigger")
+	select {
+	case <-terminated:
+		t.Fatal("wrapper termination ran more than once")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 

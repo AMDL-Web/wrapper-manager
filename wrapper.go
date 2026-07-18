@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/artdarek/go-unzip"
 	"github.com/creack/pty"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type wrapperRelease struct {
@@ -114,6 +116,7 @@ func WrapperInitial(id uuid.UUID, account string, password string) {
 		DecryptPort: GenerateUniquePort(),
 		M3U8Port:    GenerateUniquePort(),
 		NoRestart:   true,
+		Done:        make(chan struct{}),
 	}
 
 	args := []string{
@@ -143,6 +146,7 @@ func WrapperInitial(id uuid.UUID, account string, password string) {
 	go handleOutput(ptmx, &instance)
 
 	err = cmd.Wait()
+	close(instance.Done)
 	if err != nil {
 		log.Warnf("Wrapper exited with error: %v\n", err)
 	}
@@ -163,6 +167,7 @@ func WrapperStart(id string, account string) {
 		DecryptPort: GenerateUniquePort(),
 		M3U8Port:    GenerateUniquePort(),
 		NoRestart:   false,
+		Done:        make(chan struct{}),
 	}
 
 	args := []string{
@@ -190,6 +195,7 @@ func WrapperStart(id string, account string) {
 	go handleOutput(ptmx, &instance)
 
 	_ = cmd.Wait()
+	close(instance.Done)
 
 	go wrapperDown(&instance)
 }
@@ -236,6 +242,8 @@ func wrapperReady(instance *WrapperInstance) {
 
 func wrapperDown(instance *WrapperInstance) {
 	log.Info(fmt.Sprintf("[wrapper %s]", strings.Split(instance.Id, "-")[0]), " Wrapper Down")
+	ReleasePort(instance.DecryptPort)
+	ReleasePort(instance.M3U8Port)
 	RemoveInstance(instance)
 	WMDispatcher.RemoveInstance(instance.Id)
 	if !instance.NoRestart {
@@ -247,14 +255,21 @@ func wrapperDown(instance *WrapperInstance) {
 
 func KillWrapper(id string) error {
 	instance := GetInstance(id)
-	if instance == nil {
+	if instance == nil || instance.Id == "" {
 		return fmt.Errorf("instance %s not found", id)
 	}
+	return signalWrapperInstance(instance)
+}
+
+func signalWrapperInstance(instance *WrapperInstance) error {
+	if instance == nil {
+		return fmt.Errorf("wrapper instance is nil")
+	}
 	if instance.Cmd == nil {
-		return fmt.Errorf("instance %s cmd is nil", id)
+		return fmt.Errorf("instance %s cmd is nil", instance.Id)
 	}
 	if instance.Cmd.Process == nil {
-		return fmt.Errorf("instance %s process is nil", id)
+		return fmt.Errorf("instance %s process is nil", instance.Id)
 	}
 	// Send SIGINT to trigger wrapper's internal child-killing signal handler
 	err := instance.Cmd.Process.Signal(os.Interrupt)
@@ -262,6 +277,36 @@ func KillWrapper(id string) error {
 		return instance.Cmd.Process.Kill()
 	}
 	return nil
+}
+
+func terminateWrapperInstance(instance *WrapperInstance, grace time.Duration) error {
+	if err := signalWrapperInstance(instance); err != nil {
+		if errors.Is(err, os.ErrProcessDone) {
+			return nil
+		}
+		return err
+	}
+	if instance.Done == nil {
+		return nil
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-instance.Done:
+		return nil
+	case <-timer.C:
+	}
+	log.Warnf("[wrapper %s] did not exit within %s after SIGINT; sending SIGKILL", strings.Split(instance.Id, "-")[0], grace)
+	if err := instance.Cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	timer.Reset(grace)
+	select {
+	case <-instance.Done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("instance %s did not exit after SIGKILL", instance.Id)
+	}
 }
 
 func provide2FACode(id string, code string) {

@@ -4,18 +4,22 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"time"
 )
+
+const wrapperTerminateGrace = 5 * time.Second
 
 var Instances []*WrapperInstance
 
 type WrapperInstance struct {
-	Id          string    `json:"id"`
-	Account     string    `json:"account"`
-	Region      string    `json:"region"`
-	DecryptPort int       `json:"-"`
-	M3U8Port    int       `json:"-"`
-	NoRestart   bool      `json:"-"`
-	Cmd         *exec.Cmd `json:"-"`
+	Id          string        `json:"id"`
+	Account     string        `json:"account"`
+	Region      string        `json:"region"`
+	DecryptPort int           `json:"-"`
+	M3U8Port    int           `json:"-"`
+	NoRestart   bool          `json:"-"`
+	Cmd         *exec.Cmd     `json:"-"`
+	Done        chan struct{} `json:"-"`
 }
 
 func SaveInstances() {

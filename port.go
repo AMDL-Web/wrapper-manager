@@ -47,3 +47,12 @@ func GenerateUniquePort() int {
 		return port
 	}
 }
+
+func ReleasePort(port int) {
+	if port < 0 {
+		return
+	}
+	portMutex.Lock()
+	delete(usedPorts, port)
+	portMutex.Unlock()
+}
