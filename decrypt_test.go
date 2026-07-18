@@ -146,6 +146,49 @@ func TestDispatcherRoutesAroundFullInstance(t *testing.T) {
 	}
 }
 
+func TestDispatcherRoutesAroundQuarantinedInstance(t *testing.T) {
+	d, instances := newTestDispatcher(t, 2, 2)
+	bad := instances[0]
+	bad.onUnavailable = d.quarantineInstance
+	terminated := make(chan struct{}, 1)
+	bad.terminateWrapper = func() error {
+		terminated <- struct{}{}
+		return nil
+	}
+	bad.Unavailable("test quarantine")
+	select {
+	case <-terminated:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wrapper termination")
+	}
+
+	for i := 0; i < 2; i++ {
+		session, err := d.OpenSession(context.Background(), "song", "key")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session.instance != instances[1] {
+			t.Fatal("dispatcher selected quarantined instance")
+		}
+		session.Close()
+	}
+	if got := d.snapshotInstances(); len(got) != 1 || got[0] != instances[1] {
+		t.Fatalf("dispatcher instances = %#v, want only healthy instance", got)
+	}
+}
+
+func TestQuarantineDoesNotRemoveSameIDReplacement(t *testing.T) {
+	d := NewDispatcher()
+	old := &DecryptInstance{id: "same", connections: make(map[*decryptConn]struct{})}
+	replacement := &DecryptInstance{id: "same", connections: make(map[*decryptConn]struct{})}
+	d.Instances = []*DecryptInstance{replacement}
+	d.quarantineInstance(old, "stale failure")
+	got := d.snapshotInstances()
+	if len(got) != 1 || got[0] != replacement {
+		t.Fatal("stale quarantine removed same-ID replacement")
+	}
+}
+
 func TestDispatcherFullPoolsHonorCancellation(t *testing.T) {
 	d, instances := newTestDispatcher(t, 2, 1)
 	for _, instance := range instances {
