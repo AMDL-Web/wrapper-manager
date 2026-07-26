@@ -209,7 +209,8 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 			sessionAdamId = req.Data.AdamId
 		}
 
-		result, decryptErr := session.Decrypt(req.Data.AdamId, req.Data.Key, req.Data.Sample)
+		result, next, decryptErr := decryptWithFailover(stream.Context(), WMDispatcher, session, req.Data)
+		session = next
 		if decryptErr != nil {
 			if err := stream.Send(&pb.DecryptReply{
 				Header: &pb.ReplyHeader{
@@ -224,7 +225,6 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 			}); err != nil {
 				return err
 			}
-			session = nil // Decrypt discarded the failed connection.
 		} else {
 			if err := stream.Send(newDecryptSuccessReply(
 				successHeader,
@@ -235,6 +235,45 @@ func (s *server) Decrypt(stream grpc.BidiStreamingServer[pb.DecryptRequest, pb.D
 			)); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+// decryptWithFailover decrypts one sample, moving it to a different wrapper
+// instance if the one holding the session faults locally. A wedged or reset
+// wrapper then costs the client a few extra milliseconds instead of killing the
+// track: the caller's stream stays open and still receives a success reply for
+// this sample index.
+//
+// It returns the session to keep using, which is nil once every attempt has
+// failed — DecryptSession.Decrypt discards its connection on error, so a faulted
+// session is never reusable. Each instance is tried at most once per sample, and
+// the error reported is the first fault rather than the placement failure that
+// ended the search, because the first one says what actually went wrong.
+func decryptWithFailover(ctx context.Context, dispatcher *Dispatcher, session *DecryptSession, data *pb.DecryptData) ([]byte, *DecryptSession, error) {
+	result, err := session.Decrypt(data.AdamId, data.Key, data.Sample)
+	if err == nil {
+		return result, session, nil
+	}
+	firstErr := err
+	tried := make(map[*DecryptInstance]bool)
+	for {
+		var fault *decryptFault
+		if !errors.As(err, &fault) || fault.instance == nil || !fault.replayable {
+			return nil, nil, firstErr
+		}
+		tried[fault.instance] = true
+		nextSession, openErr := dispatcher.OpenSessionExcluding(ctx, data.AdamId, data.Key, tried)
+		if openErr != nil {
+			return nil, nil, firstErr
+		}
+		log.Warnf(
+			"decrypt failover for Adam ID %s: instance %s faulted, retrying on instance %s: %v",
+			data.AdamId, fault.instance.id, nextSession.instance.id, err,
+		)
+		result, err = nextSession.Decrypt(data.AdamId, data.Key, data.Sample)
+		if err == nil {
+			return result, nextSession, nil
 		}
 	}
 }

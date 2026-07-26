@@ -323,6 +323,35 @@ func (s *DecryptSession) currentConn() (*decryptConn, error) {
 	return s.conn, nil
 }
 
+// decryptFault marks a decrypt failure that a different wrapper instance could
+// plausibly satisfy: the local wrapper misbehaved (as opposed to the client
+// going away), so replaying the same sample elsewhere is worth trying.
+//
+// replayable additionally records that the request sample is still byte-for-byte
+// as the client sent it. Decryption reads the plaintext back over the request
+// buffer, so a read that already delivered some bytes has overwritten part of
+// the ciphertext; replaying that would hand the next instance a corrupt sample
+// and yield silently wrong audio rather than an error.
+type decryptFault struct {
+	instance   *DecryptInstance
+	err        error
+	replayable bool
+}
+
+func (f *decryptFault) Error() string { return f.err.Error() }
+
+func (f *decryptFault) Unwrap() error { return f.err }
+
+// fault wraps err for the failover path. Non-local errors (client cancellation,
+// client deadline) are returned unwrapped: retrying them elsewhere would only
+// burn another instance's capacity on work nobody is waiting for.
+func (s *DecryptSession) fault(err error, local, replayable bool) error {
+	if !local {
+		return err
+	}
+	return &decryptFault{instance: s.instance, err: err, replayable: replayable}
+}
+
 func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, error) {
 	if err := s.ctx.Err(); err != nil {
 		s.Discard()
@@ -335,18 +364,22 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	if c.lastAdamId != adamId || c.lastKey != key {
 		if err := s.instance.switchConnContext(s.ctx, c, adamId, key); err != nil {
 			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", err)
+			local, _ := classifyLocalWrapperIOError(s.ctx, err)
 			s.Discard()
-			return nil, mapContextError(s.ctx, err)
+			// The sample was never written to the wrapper, so it is always
+			// intact here regardless of how the context switch failed.
+			return nil, s.fault(mapContextError(s.ctx, err), local, true)
 		}
 	}
 	// Recv gives each request its own sample storage. Once the encrypted bytes
 	// are written to the wrapper, read the plaintext back into that same slice.
 	// The slice is sent once and is never modified by a later request.
-	result, err := s.instance.decryptConn(s.ctx, c, payload, payload)
+	result, read, err := s.instance.decryptConn(s.ctx, c, payload, payload)
 	if err != nil {
 		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "decrypt", err)
+		local, _ := classifyLocalWrapperIOError(s.ctx, err)
 		s.Discard()
-		return nil, mapContextError(s.ctx, err)
+		return nil, s.fault(mapContextError(s.ctx, err), local, read == 0)
 	}
 	return result, nil
 }
@@ -497,15 +530,19 @@ func (d *DecryptInstance) setOperationDeadline(ctx context.Context, conn net.Con
 	return nil
 }
 
-func (d *DecryptInstance) decryptConn(ctx context.Context, c *decryptConn, sample, plaintext []byte) ([]byte, error) {
+// decryptConn returns the plaintext along with the number of bytes read into
+// the plaintext buffer. Callers that alias plaintext onto the request sample
+// need that count to know whether the request survived a failure intact: only
+// a zero-byte read leaves the ciphertext replayable on another instance.
+func (d *DecryptInstance) decryptConn(ctx context.Context, c *decryptConn, sample, plaintext []byte) ([]byte, int, error) {
 	if len(sample) == 0 {
-		return nil, errors.New("empty decrypt sample")
+		return nil, 0, errors.New("empty decrypt sample")
 	}
 	if len(plaintext) != len(sample) {
-		return nil, errors.New("plaintext buffer length does not match decrypt sample")
+		return nil, 0, errors.New("plaintext buffer length does not match decrypt sample")
 	}
 	if err := d.setOperationDeadline(ctx, c.conn); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	binary.LittleEndian.PutUint32(c.writeHeader[:], uint32(len(sample)))
 	c.writeParts[0] = c.writeHeader[:]
@@ -517,12 +554,13 @@ func (d *DecryptInstance) decryptConn(ctx context.Context, c *decryptConn, sampl
 	c.writeParts[1] = nil
 	c.writeBuffers = nil
 	if writeErr != nil {
-		return nil, writeErr
+		return nil, 0, writeErr
 	}
-	if _, err := io.ReadFull(c.conn, plaintext); err != nil {
-		return nil, err
+	read, err := io.ReadFull(c.conn, plaintext)
+	if err != nil {
+		return nil, read, err
 	}
-	return plaintext, nil
+	return plaintext, read, nil
 }
 
 func (d *DecryptInstance) switchConnContext(ctx context.Context, c *decryptConn, adamId, key string) error {

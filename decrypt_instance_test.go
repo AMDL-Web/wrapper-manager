@@ -18,9 +18,14 @@ type fakeDecryptServer struct {
 	acceptDone chan struct{}
 	accepts    atomic.Int32
 	contexts   atomic.Int32
-	wg         sync.WaitGroup
-	mu         sync.Mutex
-	conns      map[net.Conn]struct{}
+	samples    atomic.Int32
+	// faulty makes the server drop the connection after reading a sample,
+	// whatever the payload, so one instance can be sick while another stays
+	// healthy on the same request bytes.
+	faulty atomic.Bool
+	wg     sync.WaitGroup
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
 }
 
 type fakeTimeoutError struct{}
@@ -111,6 +116,10 @@ func (s *fakeDecryptServer) serveConn(conn net.Conn) {
 			}
 			payload := make([]byte, size)
 			if _, err := io.ReadFull(conn, payload); err != nil {
+				return
+			}
+			s.samples.Add(1)
+			if s.faulty.Load() {
 				return
 			}
 			if string(payload) == "fail" {

@@ -169,6 +169,19 @@ func (d *Dispatcher) availableInstances(ctx context.Context, adamId string, inst
 	return result, nil
 }
 
+func filterExcluded(instances []*DecryptInstance, exclude map[*DecryptInstance]bool) []*DecryptInstance {
+	if len(exclude) == 0 {
+		return instances
+	}
+	kept := make([]*DecryptInstance, 0, len(instances))
+	for _, inst := range instances {
+		if !exclude[inst] {
+			kept = append(kept, inst)
+		}
+	}
+	return kept
+}
+
 type instanceCandidate struct {
 	instance *DecryptInstance
 	load     instanceLoad
@@ -216,6 +229,23 @@ func (d *Dispatcher) reserveBest(instances []*DecryptInstance, adamId, key strin
 }
 
 func (d *Dispatcher) OpenSession(ctx context.Context, adamId, key string) (*DecryptSession, error) {
+	return d.openSession(ctx, adamId, key, nil)
+}
+
+// OpenSessionExcluding places a session on any instance outside exclude. It is
+// the failover entry point: a caller whose decrypt just faulted uses it to move
+// the same work elsewhere instead of failing the client's stream. Excluding
+// rather than re-ranking matters because a faulting instance sheds its sessions
+// and so looks *least* loaded to reserveBest — plain re-selection would steer
+// the retry straight back into it.
+//
+// It returns an error rather than waiting when every remaining instance is
+// excluded, so the caller can report the original fault instead of hanging.
+func (d *Dispatcher) OpenSessionExcluding(ctx context.Context, adamId, key string, exclude map[*DecryptInstance]bool) (*DecryptSession, error) {
+	return d.openSession(ctx, adamId, key, exclude)
+}
+
+func (d *Dispatcher) openSession(ctx context.Context, adamId, key string, exclude map[*DecryptInstance]bool) (*DecryptSession, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -231,6 +261,7 @@ func (d *Dispatcher) OpenSession(ctx context.Context, adamId, key string) (*Decr
 		if err != nil {
 			return nil, err
 		}
+		available = filterExcluded(available, exclude)
 		if len(available) == 0 {
 			return nil, fmt.Errorf("no available instance")
 		}

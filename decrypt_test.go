@@ -11,11 +11,19 @@ import (
 
 func newTestDispatcher(t *testing.T, count, poolLimit int) (*Dispatcher, []*DecryptInstance) {
 	t.Helper()
+	d, instances, _ := newTestDispatcherWithServers(t, count, poolLimit)
+	return d, instances
+}
+
+func newTestDispatcherWithServers(t *testing.T, count, poolLimit int) (*Dispatcher, []*DecryptInstance, []*fakeDecryptServer) {
+	t.Helper()
 	d := NewDispatcher()
 	d.checkRegion = func(context.Context, string, string, bool) (bool, error) { return true, nil }
 	instances := make([]*DecryptInstance, 0, count)
+	servers := make([]*fakeDecryptServer, 0, count)
 	for i := 0; i < count; i++ {
 		server := newFakeDecryptServer(t)
+		servers = append(servers, server)
 		instance, err := NewDecryptInstance(&WrapperInstance{
 			Id:          string(rune('a' + i)),
 			Region:      "us",
@@ -34,7 +42,7 @@ func newTestDispatcher(t *testing.T, count, poolLimit int) (*Dispatcher, []*Decr
 			instance.Close()
 		}
 	})
-	return d, instances
+	return d, instances, servers
 }
 
 func openHeldSessions(t *testing.T, d *Dispatcher, adamIDs []string) []*DecryptSession {
