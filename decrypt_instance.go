@@ -77,6 +77,8 @@ type DecryptSession struct {
 	conn       *decryptConn
 	ctx        context.Context
 	stopCancel func() bool
+	latency    sampleLatency
+	adamID     string
 
 	mu     sync.Mutex
 	closed bool
@@ -402,7 +404,10 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	// Recv gives each request its own sample storage. Once the encrypted bytes
 	// are written to the wrapper, read the plaintext back into that same slice.
 	// The slice is sent once and is never modified by a later request.
+	s.adamID = adamId
+	started := time.Now()
 	result, read, err := s.instance.decryptConn(s.ctx, c, payload, payload)
+	s.latency.observe(time.Since(started))
 	if err != nil {
 		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "decrypt", err)
 		local, _ := classifyLocalWrapperIOError(s.ctx, err)
@@ -546,6 +551,7 @@ func (s *DecryptSession) Close() {
 	if !ok {
 		return
 	}
+	s.latency.log(s.instance.id, s.adamID)
 	_ = c.conn.SetDeadline(time.Time{})
 	s.instance.releaseConn(c)
 }
@@ -555,6 +561,7 @@ func (s *DecryptSession) Discard() {
 	if !ok {
 		return
 	}
+	s.latency.log(s.instance.id, s.adamID)
 	s.instance.discardConn(c)
 }
 
