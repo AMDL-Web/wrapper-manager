@@ -20,25 +20,34 @@ const (
 	// a single sample, or one context switch. It is not a per-fragment or
 	// per-track budget.
 	//
-	// Sizing it from mean throughput gives the wrong answer, and an earlier
-	// value of three seconds came from exactly that mistake. Measured on rog
-	// over 51,297 samples of one 8-track hi-res ALAC album, the steady state is
-	// indeed ~600-900 µs with p99 under a millisecond and 99.97% of samples at
-	// or under 2 ms — but every track also produced one or two samples between
-	// 250 ms and 1.637 s. Against that tail three seconds is 1.8x of headroom,
-	// not the thousandfold the mean implies, and this was a light run: the
-	// benchmarked 64-track load stretches the tail further.
+	// Sizing it from a blended mean gives the wrong answer, and an earlier
+	// single value of three seconds came from exactly that mistake. Splitting
+	// the measurement by population shows why. Over two 8-track hi-res ALAC
+	// albums on rog:
 	//
-	// Ten seconds clears the worst observed sample sixfold while still cutting
-	// two thirds off the thirty seconds a caller used to wait on a wrapper that
-	// had stopped answering. See sampleLatency for where those numbers come
-	// from; a run's own figures are logged when each session closes.
-	defaultDecryptIOTimeout  = 10 * time.Second
-	maxPoolSize              = 10
-	wrapperFailureWindow     = 60 * time.Second
-	wrapperFailureThreshold  = 3
-	wrapperFailureMinConns   = 3
-	wrapperFailureMinAdamIDs = 2
+	//   context-switch write    25-131 µs         never a factor
+	//   steady-state decrypt    p99 <= 2 ms, worst 4.751 ms over ~51,000
+	//   first decrypt after a   743 ms - 2.259 s on a healthy instance
+	//   context switch          (the wrapper's key setup lands on this read)
+	//
+	// So the tail is not random jitter spread through the run: it is one or two
+	// operations per track, exactly where a key changes, and it is four orders
+	// of magnitude away from the samples around it. One deadline covering both
+	// populations has to be sized for the slow one, which leaves the 99.97% of
+	// operations that are steady-state waiting far longer than they ever need
+	// to before a wedged wrapper is noticed.
+	//
+	// Two seconds is ~400x the worst steady-state sample observed.
+	defaultDecryptIOTimeout = 2 * time.Second
+	// defaultFirstSampleIOTimeout covers the first decrypt after a context
+	// switch. Ten seconds is roughly 4.4x the worst healthy instance observed;
+	// a sick one blew straight through it, which is the outcome wanted.
+	defaultFirstSampleIOTimeout = 10 * time.Second
+	maxPoolSize                 = 10
+	wrapperFailureWindow        = 60 * time.Second
+	wrapperFailureThreshold     = 3
+	wrapperFailureMinConns      = 3
+	wrapperFailureMinAdamIDs    = 2
 	// wrapperTimeoutThreshold is how many timeouts inside wrapperFailureWindow
 	// declare the local wrapper wedged. A timeout no longer condemns the process
 	// on its own: at defaultDecryptIOTimeout a single one is a host hiccup as
@@ -54,9 +63,12 @@ const (
 	wrapperTimeoutThreshold = 2
 )
 
-// decryptIOTimeout is the effective per-operation deadline, overridable at
-// startup by -decrypt-timeout for hosts slower than the benchmarked ones.
-var decryptIOTimeout = defaultDecryptIOTimeout
+// The effective deadlines, overridable at startup by -decrypt-timeout and
+// -first-sample-timeout for hosts slower than the benchmarked ones.
+var (
+	decryptIOTimeout     = defaultDecryptIOTimeout
+	firstSampleIOTimeout = defaultFirstSampleIOTimeout
+)
 
 var errInstanceBusy = errors.New("decrypt instance is at capacity")
 
@@ -108,18 +120,19 @@ type DecryptInstance struct {
 	region      string
 	decryptPort int
 
-	poolMu           sync.Mutex
-	pool             []*decryptConn
-	connections      map[*decryptConn]struct{}
-	reserved         int
-	isClosed         bool
-	poolLimit        int
-	dialContext      dialContextFunc
-	ioTimeout        time.Duration
-	onCapacity       func()
-	onUnavailable    func(*DecryptInstance, string)
-	terminateWrapper func() error
-	now              func() time.Time
+	poolMu             sync.Mutex
+	pool               []*decryptConn
+	connections        map[*decryptConn]struct{}
+	reserved           int
+	isClosed           bool
+	poolLimit          int
+	dialContext        dialContextFunc
+	ioTimeout          time.Duration
+	firstSampleTimeout time.Duration
+	onCapacity         func()
+	onUnavailable      func(*DecryptInstance, string)
+	terminateWrapper   func() error
+	now                func() time.Time
 
 	healthMu sync.Mutex
 	failures []wrapperIOFailure
@@ -132,16 +145,17 @@ type DecryptInstance struct {
 func NewDecryptInstance(inst *WrapperInstance) (*DecryptInstance, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	instance := &DecryptInstance{
-		id:               inst.Id,
-		region:           inst.Region,
-		decryptPort:      inst.DecryptPort,
-		pool:             make([]*decryptConn, 0, maxPoolSize),
-		connections:      make(map[*decryptConn]struct{}, maxPoolSize),
-		poolLimit:        maxPoolSize,
-		dialContext:      dialer.DialContext,
-		ioTimeout:        decryptIOTimeout,
-		terminateWrapper: func() error { return terminateWrapperInstance(inst, wrapperTerminateGrace) },
-		now:              time.Now,
+		id:                 inst.Id,
+		region:             inst.Region,
+		decryptPort:        inst.DecryptPort,
+		pool:               make([]*decryptConn, 0, maxPoolSize),
+		connections:        make(map[*decryptConn]struct{}, maxPoolSize),
+		poolLimit:          maxPoolSize,
+		dialContext:        dialer.DialContext,
+		ioTimeout:          decryptIOTimeout,
+		firstSampleTimeout: firstSampleIOTimeout,
+		terminateWrapper:   func() error { return terminateWrapperInstance(inst, wrapperTerminateGrace) },
+		now:                time.Now,
 	}
 
 	// Pre-warm one connection both to validate the wrapper and to keep the
@@ -423,8 +437,12 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	// are written to the wrapper, read the plaintext back into that same slice.
 	// The slice is sent once and is never modified by a later request.
 	s.adamID = adamId
+	budget := s.instance.ioTimeout
+	if switched {
+		budget = s.instance.firstSampleTimeout
+	}
 	started := time.Now()
-	result, read, err := s.instance.decryptConn(s.ctx, c, payload, payload)
+	result, read, err := s.instance.decryptConn(s.ctx, c, payload, payload, budget)
 	elapsed := time.Since(started)
 	if switched {
 		s.firstLatency.observe(elapsed)
@@ -531,7 +549,7 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 		if timedOut {
 			// Below the timeout threshold, so this instance is suspect rather than
 			// condemned. The sample itself is not lost: the caller fails it over.
-			logrus.Warnf("wrapper instance %s local %s I/O timed out after %s (1/%d in %s) for Adam ID %s", d.id, stage, d.ioTimeout, wrapperTimeoutThreshold, wrapperFailureWindow, adamID)
+			logrus.Warnf("wrapper instance %s local %s I/O timed out (1/%d in %s) for Adam ID %s: %v", d.id, stage, wrapperTimeoutThreshold, wrapperFailureWindow, adamID, err)
 			return
 		}
 		logrus.Warnf("wrapper instance %s local %s I/O failure (%d/%d in %s): %v", d.id, stage, failureCount, wrapperFailureThreshold, wrapperFailureWindow, err)
@@ -588,11 +606,11 @@ func (s *DecryptSession) Discard() {
 	s.instance.discardConn(c)
 }
 
-func (d *DecryptInstance) setOperationDeadline(ctx context.Context, conn net.Conn) error {
+func (d *DecryptInstance) setOperationDeadline(ctx context.Context, conn net.Conn, budget time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(d.ioTimeout)
+	deadline := time.Now().Add(budget)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
@@ -600,7 +618,7 @@ func (d *DecryptInstance) setOperationDeadline(ctx context.Context, conn net.Con
 		return err
 	}
 	// Cancellation can race the future deadline above. Recheck after setting it
-	// so an already-fired cancellation can never be extended to ioTimeout.
+	// so an already-fired cancellation can never be extended to the budget.
 	if err := ctx.Err(); err != nil {
 		_ = conn.SetDeadline(time.Now())
 		return err
@@ -612,14 +630,14 @@ func (d *DecryptInstance) setOperationDeadline(ctx context.Context, conn net.Con
 // the plaintext buffer. Callers that alias plaintext onto the request sample
 // need that count to know whether the request survived a failure intact: only
 // a zero-byte read leaves the ciphertext replayable on another instance.
-func (d *DecryptInstance) decryptConn(ctx context.Context, c *decryptConn, sample, plaintext []byte) ([]byte, int, error) {
+func (d *DecryptInstance) decryptConn(ctx context.Context, c *decryptConn, sample, plaintext []byte, budget time.Duration) ([]byte, int, error) {
 	if len(sample) == 0 {
 		return nil, 0, errors.New("empty decrypt sample")
 	}
 	if len(plaintext) != len(sample) {
 		return nil, 0, errors.New("plaintext buffer length does not match decrypt sample")
 	}
-	if err := d.setOperationDeadline(ctx, c.conn); err != nil {
+	if err := d.setOperationDeadline(ctx, c.conn, budget); err != nil {
 		return nil, 0, err
 	}
 	binary.LittleEndian.PutUint32(c.writeHeader[:], uint32(len(sample)))
@@ -642,7 +660,10 @@ func (d *DecryptInstance) decryptConn(ctx context.Context, c *decryptConn, sampl
 }
 
 func (d *DecryptInstance) switchConnContext(ctx context.Context, c *decryptConn, adamId, key string) error {
-	if err := d.setOperationDeadline(ctx, c.conn); err != nil {
+	// The write itself measures 25-131 µs; it is the read that follows on the
+	// next decrypt that carries the wrapper's key setup, so the steady budget
+	// is the right one here.
+	if err := d.setOperationDeadline(ctx, c.conn, d.ioTimeout); err != nil {
 		return err
 	}
 	if c.lastKey != "" {

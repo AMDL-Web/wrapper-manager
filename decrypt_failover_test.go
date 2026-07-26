@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	pb "github.com/AMDL-Web/wrapper-manager/proto"
 )
@@ -170,5 +171,62 @@ func TestOpenSessionExcludingFailsWhenNothingRemains(t *testing.T) {
 	if err == nil {
 		session.Close()
 		t.Fatal("OpenSessionExcluding returned a session with every instance excluded")
+	}
+}
+
+// The two budgets exist because the two populations differ by four orders of
+// magnitude. Pin that they are actually applied per operation, not blended
+// back into one effective deadline.
+func TestFirstSampleAfterContextSwitchGetsTheLongerDeadline(t *testing.T) {
+	newInstance := func(id string) *DecryptInstance {
+		t.Helper()
+		server := newFakeDecryptServer(t)
+		instance, err := NewDecryptInstance(&WrapperInstance{Id: id, Region: "cn", DecryptPort: server.port()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(instance.Close)
+		instance.ioTimeout = 50 * time.Millisecond
+		instance.firstSampleTimeout = 1500 * time.Millisecond
+		instance.terminateWrapper = func() error { return nil }
+		return instance
+	}
+
+	// Separate instances so neither sees two timeouts and quarantines itself
+	// mid-test.
+	first := newInstance("first")
+	steady := newInstance("steady")
+
+	// A session's opening decrypt always switches context away from the
+	// pre-warm key, so this one is charged the long budget.
+	firstSession, err := first.OpenSession(context.Background(), "song-1", "key-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if _, err := firstSession.Decrypt("song-1", "key-1", []byte("block")); err == nil {
+		t.Fatal("expected the blocked sample to time out")
+	}
+	if elapsed := time.Since(started); elapsed < first.firstSampleTimeout/2 {
+		t.Fatalf("first sample after a context switch timed out in %s, i.e. on the steady deadline (%s) rather than its own (%s)",
+			elapsed, first.ioTimeout, first.firstSampleTimeout)
+	}
+
+	steadySession, err := steady.OpenSession(context.Background(), "song-2", "key-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Spend the context switch on a sample the server answers, so the next one
+	// is steady state.
+	if _, err := steadySession.Decrypt("song-2", "key-2", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	started = time.Now()
+	if _, err := steadySession.Decrypt("song-2", "key-2", []byte("block")); err == nil {
+		t.Fatal("expected the blocked sample to time out")
+	}
+	if elapsed := time.Since(started); elapsed >= steady.firstSampleTimeout/2 {
+		t.Fatalf("steady-state sample timed out in %s, i.e. on the first-sample deadline (%s) rather than its own (%s)",
+			elapsed, steady.firstSampleTimeout, steady.ioTimeout)
 	}
 }

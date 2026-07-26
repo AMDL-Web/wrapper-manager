@@ -294,9 +294,10 @@ func TestCanceledOpenSessionReturnsIdleConnection(t *testing.T) {
 func TestCancellationAfterDialDoesNotLeakConnectionAccounting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	instance := &DecryptInstance{
-		connections: make(map[*decryptConn]struct{}),
-		poolLimit:   1,
-		ioTimeout:   time.Second,
+		connections:        make(map[*decryptConn]struct{}),
+		poolLimit:          1,
+		ioTimeout:          time.Second,
+		firstSampleTimeout: time.Second,
 		dialContext: func(context.Context, string, string) (net.Conn, error) {
 			client, server := net.Pipe()
 			_ = server.Close()
@@ -401,6 +402,7 @@ func TestSingleWrapperIOTimeoutDoesNotQuarantineInstance(t *testing.T) {
 	}
 	t.Cleanup(instance.Close)
 	instance.ioTimeout = 30 * time.Millisecond
+	instance.firstSampleTimeout = 30 * time.Millisecond
 	terminated := make(chan struct{}, 2)
 	instance.terminateWrapper = func() error {
 		terminated <- struct{}{}
@@ -434,6 +436,7 @@ func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	instance.ioTimeout = 30 * time.Millisecond
+	instance.firstSampleTimeout = 30 * time.Millisecond
 	terminated := make(chan struct{}, 2)
 	instance.terminateWrapper = func() error {
 		terminated <- struct{}{}
@@ -532,6 +535,7 @@ func TestClientDeadlineDoesNotQuarantineWrapper(t *testing.T) {
 		t.Fatal(err)
 	}
 	instance.ioTimeout = time.Second
+	instance.firstSampleTimeout = time.Second
 	var terminations atomic.Int32
 	instance.terminateWrapper = func() error {
 		terminations.Add(1)

@@ -282,8 +282,9 @@ func TestDispatcherDialFailureRollsBackAndTriesAnotherInstance(t *testing.T) {
 		dialContext: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("dial failed")
 		},
-		ioTimeout:  time.Second,
-		onCapacity: d.signalCapacity,
+		ioTimeout:          time.Second,
+		firstSampleTimeout: time.Second,
+		onCapacity:         d.signalCapacity,
 	}
 	d.Instances = []*DecryptInstance{bad, healthy[0]}
 

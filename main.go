@@ -552,7 +552,8 @@ func main() {
 	var mirror = flag.Bool("mirror", false, "use mirror to download wrapper and file (for Chinese users)")
 	var debug = flag.Bool("debug", false, "enable debug output")
 	var prepare = flag.Bool("prepare", false, "only download required files")
-	var decryptTimeout = flag.Duration("decrypt-timeout", defaultDecryptIOTimeout, "per-operation wrapper decrypt deadline (one sample or one context switch), not a per-track budget")
+	var decryptTimeout = flag.Duration("decrypt-timeout", defaultDecryptIOTimeout, "steady-state wrapper decrypt deadline for one sample, not a per-fragment or per-track budget")
+	var firstSampleTimeout = flag.Duration("first-sample-timeout", defaultFirstSampleIOTimeout, "deadline for the first decrypt after a context switch, which carries the wrapper's key setup")
 	flag.StringVar(&PROXY, "proxy", "", "proxy for wrapper and manager")
 	flag.StringVar(&DeviceInfo, "device-info", "Music/5.0.2/Android/10/Pixel 10/7663314/en-US/en-US/dc28071e371c439e", "device info for wrapper")
 	flag.Parse()
@@ -560,7 +561,11 @@ func main() {
 	if *decryptTimeout <= 0 {
 		log.Panicf("-decrypt-timeout must be positive, got %s", *decryptTimeout)
 	}
+	if *firstSampleTimeout <= 0 {
+		log.Panicf("-first-sample-timeout must be positive, got %s", *firstSampleTimeout)
+	}
 	decryptIOTimeout = *decryptTimeout
+	firstSampleIOTimeout = *firstSampleTimeout
 
 	log.SetOutput(os.Stdout)
 	if *debug {
