@@ -436,7 +436,7 @@ func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	instance.ioTimeout = 30 * time.Millisecond
-	instance.firstSampleTimeout = 30 * time.Millisecond
+	instance.firstSampleTimeout = 5 * time.Second
 	terminated := make(chan struct{}, 2)
 	instance.terminateWrapper = func() error {
 		terminated <- struct{}{}
@@ -445,10 +445,15 @@ func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
 
 	// wrapperTimeoutThreshold timeouts inside the window declare it wedged. Each
 	// one is a separate session, as it would be in production: Decrypt discards
-	// the connection it faulted on.
+	// the connection it faulted on. The timeouts have to be steady-state ones —
+	// a slow first sample after a context switch is not evidence about the
+	// process, so it deliberately never reaches this rule.
 	for i := 0; i < wrapperTimeoutThreshold; i++ {
 		session, err := instance.OpenSession(context.Background(), "song-1", "key-1")
 		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.Decrypt("song-1", "key-1", []byte("ok")); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := session.Decrypt("song-1", "key-1", []byte("block")); err == nil {
@@ -502,6 +507,7 @@ func TestConcurrentWrapperIOTimeoutsScheduleSingleTermination(t *testing.T) {
 				&decryptConn{},
 				fmt.Sprintf("song-%d", i),
 				"decrypt",
+				true,
 				fakeTimeoutError{},
 			)
 		}(i)
@@ -574,7 +580,7 @@ func TestRepeatedConnectionFailuresAcrossSongsQuarantineOnce(t *testing.T) {
 		return nil
 	}
 	for i, adamID := range []string{"song-1", "song-1", "song-2"} {
-		instance.observeWrapperIOFailure(context.Background(), &decryptConn{}, adamID, "decrypt", io.EOF)
+		instance.observeWrapperIOFailure(context.Background(), &decryptConn{}, adamID, "decrypt", true, io.EOF)
 		if i < 2 {
 			select {
 			case <-terminated:

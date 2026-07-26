@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -228,5 +229,91 @@ func TestFirstSampleAfterContextSwitchGetsTheLongerDeadline(t *testing.T) {
 	if elapsed := time.Since(started); elapsed >= steady.firstSampleTimeout/2 {
 		t.Fatalf("steady-state sample timed out in %s, i.e. on the first-sample deadline (%s) rather than its own (%s)",
 			elapsed, steady.firstSampleTimeout, steady.ioTimeout)
+	}
+}
+
+// The regression this pins actually shipped: a first-sample timeout was counted
+// as evidence of a wedged wrapper, so an album's worth of legitimately slow key
+// setups restarted healthy instances and failed whole jobs. The first decrypt
+// after a context switch has no characterised ceiling — healthy instances have
+// been measured past ten seconds — so exceeding its budget must cost the sample
+// a failover and nothing more.
+func TestSlowFirstSampleDoesNotCountAgainstInstanceHealth(t *testing.T) {
+	server := newFakeDecryptServer(t)
+	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(instance.Close)
+	// A budget the fake server will always blow through on the opening decrypt,
+	// which is charged the first-sample budget because it switches context.
+	instance.ioTimeout = 30 * time.Millisecond
+	instance.firstSampleTimeout = 30 * time.Millisecond
+	terminated := make(chan struct{}, 4)
+	instance.terminateWrapper = func() error {
+		terminated <- struct{}{}
+		return nil
+	}
+
+	// Far more than either health threshold, across distinct connections and
+	// songs so the general failure rule would trip too if these reached it.
+	for i, adamID := range []string{"song-1", "song-2", "song-3", "song-4"} {
+		session, err := instance.OpenSession(context.Background(), adamID, fmt.Sprintf("key-%d", i))
+		if err != nil {
+			t.Fatalf("instance stopped serving after %d slow first samples: %v", i, err)
+		}
+		if _, err := session.Decrypt(adamID, fmt.Sprintf("key-%d", i), []byte("block")); err == nil {
+			t.Fatal("expected the first sample to exceed its budget")
+		}
+	}
+
+	select {
+	case <-terminated:
+		t.Fatal("slow first samples restarted a healthy wrapper")
+	case <-time.After(100 * time.Millisecond):
+	}
+	instance.poolMu.Lock()
+	closed := instance.isClosed
+	instance.poolMu.Unlock()
+	if closed {
+		t.Fatal("slow first samples quarantined a healthy instance")
+	}
+}
+
+// The steady-state budget sits ~400x above the worst sample ever measured, so
+// timeouts there stay conclusive and must still reach the wedged-wrapper rule.
+func TestSteadyStateTimeoutsStillQuarantine(t *testing.T) {
+	server := newFakeDecryptServer(t)
+	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.ioTimeout = 30 * time.Millisecond
+	instance.firstSampleTimeout = 5 * time.Second
+	terminated := make(chan struct{}, 2)
+	instance.terminateWrapper = func() error {
+		terminated <- struct{}{}
+		return nil
+	}
+
+	for i := 0; i < wrapperTimeoutThreshold; i++ {
+		session, err := instance.OpenSession(context.Background(), "song-1", "key-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// First decrypt establishes the context and succeeds, so the second is
+		// charged the steady-state budget and is the one that times out.
+		if _, err := session.Decrypt("song-1", "key-1", []byte("ok")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.Decrypt("song-1", "key-1", []byte("block")); err == nil {
+			t.Fatal("expected a steady-state timeout")
+		}
+	}
+
+	select {
+	case <-terminated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("steady-state timeouts no longer quarantine a wedged wrapper")
 	}
 }

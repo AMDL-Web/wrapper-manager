@@ -40,9 +40,17 @@ const (
 	// Two seconds is ~400x the worst steady-state sample observed.
 	defaultDecryptIOTimeout = 2 * time.Second
 	// defaultFirstSampleIOTimeout covers the first decrypt after a context
-	// switch. Ten seconds is roughly 4.4x the worst healthy instance observed;
-	// a sick one blew straight through it, which is the outcome wanted.
-	defaultFirstSampleIOTimeout = 10 * time.Second
+	// switch. Ten seconds looked like 4.4x headroom over the 2.259 s worst case
+	// in the first two albums; production then produced 8.327 s completions and
+	// operations sitting on the 10 s deadline itself, so that run had simply not
+	// seen the tail. This population has no characterised ceiling.
+	//
+	// Thirty seconds is where this deadline started, and in that form it never
+	// misfired. Since a timeout here no longer counts against instance health,
+	// the only thing a budget this wide costs is how long one operation per track
+	// waits before failing over — and cutting it is what turned legitimate slow
+	// operations into restarts of healthy wrappers.
+	defaultFirstSampleIOTimeout = 30 * time.Second
 	maxPoolSize                 = 10
 	wrapperFailureWindow        = 60 * time.Second
 	wrapperFailureThreshold     = 3
@@ -424,7 +432,10 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 		switchErr := s.instance.switchConnContext(s.ctx, c, adamId, key)
 		s.switchLatency.observe(time.Since(switchStarted))
 		if switchErr != nil {
-			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", switchErr)
+			// The switch is a pure write, measured at 25-131 µs, so its budget is
+			// four orders of magnitude clear of the distribution: a timeout here
+			// really does mean the wrapper stopped reading.
+			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", true, switchErr)
 			local, _ := classifyLocalWrapperIOError(s.ctx, switchErr)
 			s.Discard()
 			// The sample was never written to the wrapper, so it is always
@@ -450,7 +461,11 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 		s.latency.observe(elapsed)
 	}
 	if err != nil {
-		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "decrypt", err)
+		stage, conclusive := "decrypt", true
+		if switched {
+			stage, conclusive = "first decrypt after context switch", false
+		}
+		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, stage, conclusive, err)
 		local, _ := classifyLocalWrapperIOError(s.ctx, err)
 		s.Discard()
 		return nil, s.fault(mapContextError(s.ctx, err), local, read == 0)
@@ -497,7 +512,23 @@ func (d *DecryptInstance) observeWrapperTimeout(now, cutoff time.Time) bool {
 	return len(d.timeouts) >= wrapperTimeoutThreshold
 }
 
-func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, err error) {
+// observeWrapperIOFailure feeds one local failure into the health rules.
+//
+// timeoutIsConclusive says whether exceeding this operation's budget is evidence
+// about the process at all. It is true where the budget sits orders of magnitude
+// above the whole observed distribution — a steady-state decrypt at 2s against a
+// 4.751 ms worst case, a context-switch write at 2s against 131 µs. It is false
+// for the first decrypt after a context switch, which is slow by nature: healthy
+// instances have been measured past ten seconds there, so a timeout says nothing
+// except that this one operation was slow.
+//
+// A non-conclusive timeout therefore feeds neither health rule — not the timeout
+// counter, and not the general failure window either. Letting it reach the
+// general rule only moves the misfire: an album produces one such operation per
+// track, which is exactly the spread of distinct connections and Adam IDs that
+// rule is looking for, and three slow tracks would restart a healthy wrapper.
+// The sample is not lost regardless; the caller fails it over.
+func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, timeoutIsConclusive bool, err error) {
 	local, timedOut := classifyLocalWrapperIOError(ctx, err)
 	if conn == nil || adamID == "" || !local {
 		return
@@ -506,6 +537,10 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 	closed := d.isClosed
 	d.poolMu.Unlock()
 	if closed {
+		return
+	}
+	if timedOut && !timeoutIsConclusive {
+		logrus.Warnf("wrapper instance %s local %s exceeded its %s budget for Adam ID %s; failing the sample over without counting it against instance health: %v", d.id, stage, d.firstSampleTimeout, adamID, err)
 		return
 	}
 	now := time.Now()
