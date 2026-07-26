@@ -389,12 +389,17 @@ func TestDecryptCancellationWithoutDeadlineInterruptsBlockedWrapperIO(t *testing
 	}
 }
 
-func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
+// A single timeout leaves the instance in service. At a three-second deadline
+// one timeout is as plausibly a host hiccup as a dead wrapper, and the sample it
+// cost is recovered by failover rather than lost — so condemning the process on
+// the strength of one would throw away every session it holds for no reason.
+func TestSingleWrapperIOTimeoutDoesNotQuarantineInstance(t *testing.T) {
 	server := newFakeDecryptServer(t)
 	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(instance.Close)
 	instance.ioTimeout = 30 * time.Millisecond
 	terminated := make(chan struct{}, 2)
 	instance.terminateWrapper = func() error {
@@ -408,6 +413,44 @@ func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
 	}
 	if _, err := session.Decrypt("song-1", "key-1", []byte("block")); err == nil {
 		t.Fatal("expected wrapper I/O timeout")
+	}
+	select {
+	case <-terminated:
+		t.Fatal("one timeout terminated the wrapper")
+	case <-time.After(100 * time.Millisecond):
+	}
+	instance.poolMu.Lock()
+	closed := instance.isClosed
+	instance.poolMu.Unlock()
+	if closed {
+		t.Fatal("one timeout quarantined the instance")
+	}
+}
+
+func TestWrapperIOTimeoutQuarantinesAndTerminatesInstanceOnce(t *testing.T) {
+	server := newFakeDecryptServer(t)
+	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.ioTimeout = 30 * time.Millisecond
+	terminated := make(chan struct{}, 2)
+	instance.terminateWrapper = func() error {
+		terminated <- struct{}{}
+		return nil
+	}
+
+	// wrapperTimeoutThreshold timeouts inside the window declare it wedged. Each
+	// one is a separate session, as it would be in production: Decrypt discards
+	// the connection it faulted on.
+	for i := 0; i < wrapperTimeoutThreshold; i++ {
+		session, err := instance.OpenSession(context.Background(), "song-1", "key-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.Decrypt("song-1", "key-1", []byte("block")); err == nil {
+			t.Fatal("expected wrapper I/O timeout")
+		}
 	}
 	select {
 	case <-terminated:

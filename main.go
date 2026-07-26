@@ -552,9 +552,15 @@ func main() {
 	var mirror = flag.Bool("mirror", false, "use mirror to download wrapper and file (for Chinese users)")
 	var debug = flag.Bool("debug", false, "enable debug output")
 	var prepare = flag.Bool("prepare", false, "only download required files")
+	var decryptTimeout = flag.Duration("decrypt-timeout", defaultDecryptIOTimeout, "per-operation wrapper decrypt deadline (one sample or one context switch), not a per-track budget")
 	flag.StringVar(&PROXY, "proxy", "", "proxy for wrapper and manager")
 	flag.StringVar(&DeviceInfo, "device-info", "Music/5.0.2/Android/10/Pixel 10/7663314/en-US/en-US/dc28071e371c439e", "device info for wrapper")
 	flag.Parse()
+
+	if *decryptTimeout <= 0 {
+		log.Panicf("-decrypt-timeout must be positive, got %s", *decryptTimeout)
+	}
+	decryptIOTimeout = *decryptTimeout
 
 	log.SetOutput(os.Stdout)
 	if *debug {

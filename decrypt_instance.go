@@ -14,15 +14,42 @@ import (
 )
 
 const (
-	defaultId                = "0"
-	prefetchKey              = "skd://itunes.apple.com/P000000000/s1/e1"
-	decryptIOTimeout         = 30 * time.Second
+	defaultId   = "0"
+	prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
+	// defaultDecryptIOTimeout bounds one wrapper request/reply over loopback:
+	// a single sample, or one context switch. It is not a per-fragment or
+	// per-track budget.
+	//
+	// The measured cost of a sample is ~1 ms on rog and ~3 ms on z16 at the
+	// pool-10 production sweet spot with 64 concurrent tracks (see
+	// CONCURRENCY_BENCHMARK.md: 15.7 KiB mean sample, 272.588 and 94.645 MiB/s
+	// across 20 streams). Three seconds is a thousandfold margin over that, and
+	// it is what a caller waits out when the wrapper stops answering — so it is
+	// sized for detection latency, not for throughput headroom.
+	defaultDecryptIOTimeout  = 3 * time.Second
 	maxPoolSize              = 10
 	wrapperFailureWindow     = 60 * time.Second
 	wrapperFailureThreshold  = 3
 	wrapperFailureMinConns   = 3
 	wrapperFailureMinAdamIDs = 2
+	// wrapperTimeoutThreshold is how many timeouts inside wrapperFailureWindow
+	// declare the local wrapper wedged. A timeout no longer condemns the process
+	// on its own: at defaultDecryptIOTimeout a single one is a host hiccup as
+	// plausibly as a dead wrapper, and killing a healthy instance costs every
+	// session it holds. Unlike wrapperFailureThreshold this rule asks nothing of
+	// connection or Adam ID diversity, because a wedged wrapper starves its
+	// caller instead of producing varied traffic — at concurrency one there is
+	// only ever one connection and one song to observe.
+	//
+	// Two timeouts still confirm the fault sooner than the single thirty-second
+	// one this replaces, and decryptWithFailover has already rescued the samples
+	// spent getting there.
+	wrapperTimeoutThreshold = 2
 )
+
+// decryptIOTimeout is the effective per-operation deadline, overridable at
+// startup by -decrypt-timeout for hosts slower than the benchmarked ones.
+var decryptIOTimeout = defaultDecryptIOTimeout
 
 var errInstanceBusy = errors.New("decrypt instance is at capacity")
 
@@ -81,6 +108,7 @@ type DecryptInstance struct {
 
 	healthMu sync.Mutex
 	failures []wrapperIOFailure
+	timeouts []time.Time
 
 	closeOnce       sync.Once
 	unavailableOnce sync.Once
@@ -408,6 +436,21 @@ func classifyLocalWrapperIOError(ctx context.Context, err error) (local, timedOu
 	return true, netErr.Timeout()
 }
 
+// observeWrapperTimeout records one timeout and reports whether the instance
+// has now produced enough of them inside the window to be called wedged.
+func (d *DecryptInstance) observeWrapperTimeout(now, cutoff time.Time) bool {
+	d.healthMu.Lock()
+	defer d.healthMu.Unlock()
+	kept := d.timeouts[:0]
+	for _, at := range d.timeouts {
+		if !at.Before(cutoff) {
+			kept = append(kept, at)
+		}
+	}
+	d.timeouts = append(kept, now)
+	return len(d.timeouts) >= wrapperTimeoutThreshold
+}
+
 func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, err error) {
 	local, timedOut := classifyLocalWrapperIOError(ctx, err)
 	if conn == nil || adamID == "" || !local {
@@ -419,20 +462,19 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 	if closed {
 		return
 	}
-	// The deadline owned by this manager is thirty seconds. A loopback wrapper
-	// operation exceeding it is already conclusive evidence of a wedged local
-	// process; waiting for more timeouts only prolongs the outage, especially at
-	// concurrency one.
-	if timedOut {
-		d.Unavailable(fmt.Sprintf("local %s I/O timed out for Adam ID %s", stage, adamID))
-		return
-	}
-
 	now := time.Now()
 	if d.now != nil {
 		now = d.now()
 	}
 	cutoff := now.Add(-wrapperFailureWindow)
+
+	if timedOut && d.observeWrapperTimeout(now, cutoff) {
+		d.Unavailable(fmt.Sprintf(
+			"%d local I/O timeouts in %s, most recently %s for Adam ID %s",
+			wrapperTimeoutThreshold, wrapperFailureWindow, stage, adamID,
+		))
+		return
+	}
 
 	d.healthMu.Lock()
 	kept := d.failures[:0]
@@ -458,6 +500,12 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 	d.healthMu.Unlock()
 
 	if !shouldTrip {
+		if timedOut {
+			// Below the timeout threshold, so this instance is suspect rather than
+			// condemned. The sample itself is not lost: the caller fails it over.
+			logrus.Warnf("wrapper instance %s local %s I/O timed out after %s (1/%d in %s) for Adam ID %s", d.id, stage, d.ioTimeout, wrapperTimeoutThreshold, wrapperFailureWindow, adamID)
+			return
+		}
 		logrus.Warnf("wrapper instance %s local %s I/O failure (%d/%d in %s): %v", d.id, stage, failureCount, wrapperFailureThreshold, wrapperFailureWindow, err)
 		return
 	}
