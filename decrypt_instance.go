@@ -20,13 +20,20 @@ const (
 	// a single sample, or one context switch. It is not a per-fragment or
 	// per-track budget.
 	//
-	// The measured cost of a sample is ~1 ms on rog and ~3 ms on z16 at the
-	// pool-10 production sweet spot with 64 concurrent tracks (see
-	// CONCURRENCY_BENCHMARK.md: 15.7 KiB mean sample, 272.588 and 94.645 MiB/s
-	// across 20 streams). Three seconds is a thousandfold margin over that, and
-	// it is what a caller waits out when the wrapper stops answering — so it is
-	// sized for detection latency, not for throughput headroom.
-	defaultDecryptIOTimeout  = 3 * time.Second
+	// Sizing it from mean throughput gives the wrong answer, and an earlier
+	// value of three seconds came from exactly that mistake. Measured on rog
+	// over 51,297 samples of one 8-track hi-res ALAC album, the steady state is
+	// indeed ~600-900 µs with p99 under a millisecond and 99.97% of samples at
+	// or under 2 ms — but every track also produced one or two samples between
+	// 250 ms and 1.637 s. Against that tail three seconds is 1.8x of headroom,
+	// not the thousandfold the mean implies, and this was a light run: the
+	// benchmarked 64-track load stretches the tail further.
+	//
+	// Ten seconds clears the worst observed sample sixfold while still cutting
+	// two thirds off the thirty seconds a caller used to wait on a wrapper that
+	// had stopped answering. See sampleLatency for where those numbers come
+	// from; a run's own figures are logged when each session closes.
+	defaultDecryptIOTimeout  = 10 * time.Second
 	maxPoolSize              = 10
 	wrapperFailureWindow     = 60 * time.Second
 	wrapperFailureThreshold  = 3
@@ -77,8 +84,14 @@ type DecryptSession struct {
 	conn       *decryptConn
 	ctx        context.Context
 	stopCancel func() bool
-	latency    sampleLatency
 	adamID     string
+	// Three populations, kept apart because they are not interchangeable when
+	// sizing the deadline: the context-switch write itself, the first decrypt
+	// after one (where the wrapper's key setup is expected to land), and every
+	// other decrypt.
+	switchLatency sampleLatency
+	firstLatency  sampleLatency
+	latency       sampleLatency
 
 	mu     sync.Mutex
 	closed bool
@@ -391,15 +404,20 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
+	switched := false
 	if c.lastAdamId != adamId || c.lastKey != key {
-		if err := s.instance.switchConnContext(s.ctx, c, adamId, key); err != nil {
-			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", err)
-			local, _ := classifyLocalWrapperIOError(s.ctx, err)
+		switchStarted := time.Now()
+		switchErr := s.instance.switchConnContext(s.ctx, c, adamId, key)
+		s.switchLatency.observe(time.Since(switchStarted))
+		if switchErr != nil {
+			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", switchErr)
+			local, _ := classifyLocalWrapperIOError(s.ctx, switchErr)
 			s.Discard()
 			// The sample was never written to the wrapper, so it is always
 			// intact here regardless of how the context switch failed.
-			return nil, s.fault(mapContextError(s.ctx, err), local, true)
+			return nil, s.fault(mapContextError(s.ctx, switchErr), local, true)
 		}
+		switched = true
 	}
 	// Recv gives each request its own sample storage. Once the encrypted bytes
 	// are written to the wrapper, read the plaintext back into that same slice.
@@ -407,7 +425,12 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	s.adamID = adamId
 	started := time.Now()
 	result, read, err := s.instance.decryptConn(s.ctx, c, payload, payload)
-	s.latency.observe(time.Since(started))
+	elapsed := time.Since(started)
+	if switched {
+		s.firstLatency.observe(elapsed)
+	} else {
+		s.latency.observe(elapsed)
+	}
 	if err != nil {
 		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "decrypt", err)
 		local, _ := classifyLocalWrapperIOError(s.ctx, err)
@@ -551,7 +574,7 @@ func (s *DecryptSession) Close() {
 	if !ok {
 		return
 	}
-	s.latency.log(s.instance.id, s.adamID)
+	s.logLatency()
 	_ = c.conn.SetDeadline(time.Time{})
 	s.instance.releaseConn(c)
 }
@@ -561,7 +584,7 @@ func (s *DecryptSession) Discard() {
 	if !ok {
 		return
 	}
-	s.latency.log(s.instance.id, s.adamID)
+	s.logLatency()
 	s.instance.discardConn(c)
 }
 

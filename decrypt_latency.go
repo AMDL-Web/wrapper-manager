@@ -101,20 +101,29 @@ func (s *sampleLatency) histogram() string {
 	return strings.Join(parts, " ")
 }
 
-// log emits one line per finished session. Info rather than Debug: it is a
-// single line per track per instance, and it is the only place the per-sample
-// cost the decrypt deadline is sized against can actually be read.
-func (s *sampleLatency) log(instanceID, adamID string) {
+// log emits one line for a finished session's population. Info rather than
+// Debug: it is a handful of lines per track, and it is the only place the
+// per-operation cost the decrypt deadline is sized against can be read.
+func (s *sampleLatency) log(kind, instanceID, adamID string) {
 	if s.count == 0 {
 		return
 	}
 	logrus.Infof(
-		"decrypt sample latency instance=%s adam_id=%s samples=%d mean=%s p50<=%s p95<=%s p99<=%s max=%s deadline=%s | %s",
-		instanceID, adamID, s.count,
+		"decrypt latency kind=%s instance=%s adam_id=%s n=%d mean=%s p50<=%s p95<=%s p99<=%s max=%s deadline=%s | %s",
+		kind, instanceID, adamID, s.count,
 		s.mean().Round(time.Microsecond),
 		s.quantile(0.50), s.quantile(0.95), s.quantile(0.99),
 		time.Duration(s.maxNS).Round(time.Microsecond),
 		decryptIOTimeout,
 		s.histogram(),
 	)
+}
+
+// logLatency reports each population separately. Keeping them apart is the
+// point: a mean taken across all of them is what produced a deadline 1.8x
+// above its own worst case rather than the thousandfold the mean suggested.
+func (s *DecryptSession) logLatency() {
+	s.switchLatency.log("context-switch", s.instance.id, s.adamID)
+	s.firstLatency.log("first-after-switch", s.instance.id, s.adamID)
+	s.latency.log("steady", s.instance.id, s.adamID)
 }
