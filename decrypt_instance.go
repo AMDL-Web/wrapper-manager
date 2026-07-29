@@ -75,11 +75,14 @@ const (
 )
 
 // emptyPoolGrace is how long a decrypt waits for an instance when every one of
-// them is restarting, before giving up. A replacement took 72s on 2026-07-29,
-// but Dispatcher.canCondemn now keeps the pool from emptying in the first
-// place, so this only covers a total loss — where waiting out a full restart
-// still beats failing, and where a manager with no wrappers configured at all
-// must still answer rather than hang.
+// them is restarting, before giving up. A replacement took 72s on 2026-07-29.
+// Dispatcher.canCondemn keeps the pool from emptying while a replacement may
+// still be arriving, so this covers the cases it deliberately allows through: a
+// total loss, a sole instance being restarted, and the bounded case where a
+// replacement never came and the wedged instance holding the pool open was
+// condemned anyway. In all of them waiting out a restart still beats failing,
+// and a manager with no wrappers configured at all must still answer rather
+// than hang.
 const emptyPoolGrace = 90 * time.Second
 
 // The effective deadlines, overridable at startup by -decrypt-timeout and
@@ -382,7 +385,7 @@ func (d *DecryptInstance) Unavailable(reason string) {
 	// consume the one shot, or the instance could never be condemned once a
 	// replacement has arrived.
 	if d.canCondemn != nil && !d.canCondemn() {
-		logrus.Warnf("wrapper instance %s is unhealthy (%s) but is the last one serving while a replacement is still starting; keeping it until the pool refills", d.id, reason)
+		logrus.Warnf("wrapper instance %s is unhealthy (%s) but is the last one serving while a replacement started less than %s ago; keeping it until the pool refills, that replacement is declared failed, or the grace expires", d.id, reason, pendingReplacementGrace)
 		return
 	}
 	d.unavailableOnce.Do(func() {

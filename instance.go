@@ -20,6 +20,12 @@ type WrapperInstance struct {
 	NoRestart   bool          `json:"-"`
 	Cmd         *exec.Cmd     `json:"-"`
 	Done        chan struct{} `json:"-"`
+	// proc carries the running process's supervision state: start time, the
+	// tail of its output, and whether the manager asked it to stop. It is a
+	// pointer and unexported because this struct is copied by value out of
+	// data/instances.json and serialised back into it; nothing here may hold a
+	// lock or be persisted. Nil for instances that have no process behind them.
+	proc *wrapperProc
 }
 
 func SaveInstances() {

@@ -49,11 +49,15 @@ func newDecryptSuccessReply(header *pb.ReplyHeader, adamID, key string, sampleIn
 
 func (s *server) Status(c context.Context, req *emptypb.Empty) (*pb.StatusReply, error) {
 	p, ok := peer.FromContext(c)
+	from := "unknown peer"
 	if ok {
-		log.Infof("status request from %s. ClientCount: %d, Ready: %v, ShouldStart: %d", p.Addr.String(), len(Instances), Ready, ShouldStartInstances)
-	} else {
-		log.Infof("status request from unknown peer. ClientCount: %d, Ready: %v, ShouldStart: %d", len(Instances), Ready, ShouldStartInstances)
+		from = p.Addr.String()
 	}
+	// Failed instances are named here because this is the line an operator reads
+	// when the pool looks short: an instance the supervisor has given up
+	// restarting is missing from ClientCount and would otherwise be silent.
+	log.Infof("status request from %s. ClientCount: %d, Ready: %v, ShouldStart: %d, Failed: %s",
+		from, len(Instances), Ready, ShouldStartInstances, describeFailedWrappers())
 	var regions []string
 	var accounts []string
 	for _, instance := range Instances {

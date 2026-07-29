@@ -117,6 +117,7 @@ func WrapperInitial(id uuid.UUID, account string, password string) {
 		M3U8Port:    GenerateUniquePort(),
 		NoRestart:   true,
 		Done:        make(chan struct{}),
+		proc:        newWrapperProc(),
 	}
 
 	args := []string{
@@ -143,15 +144,13 @@ func WrapperInitial(id uuid.UUID, account string, password string) {
 	defer func() { _ = ptmx.Close() }()
 
 	instance.Cmd = cmd
+	instance.proc.markStarted(time.Now())
 	go handleOutput(ptmx, &instance)
 
-	err = cmd.Wait()
+	waitErr := cmd.Wait()
 	close(instance.Done)
-	if err != nil {
-		log.Warnf("Wrapper exited with error: %v\n", err)
-	}
 
-	go wrapperDown(&instance)
+	go wrapperDown(&instance, waitErr)
 }
 
 func WrapperStart(id string, account string) {
@@ -168,6 +167,7 @@ func WrapperStart(id string, account string) {
 		M3U8Port:    GenerateUniquePort(),
 		NoRestart:   false,
 		Done:        make(chan struct{}),
+		proc:        newWrapperProc(),
 	}
 
 	args := []string{
@@ -192,21 +192,25 @@ func WrapperStart(id string, account string) {
 	defer func() { _ = ptmx.Close() }()
 
 	instance.Cmd = cmd
+	instance.proc.markStarted(time.Now())
 	go handleOutput(ptmx, &instance)
 
-	_ = cmd.Wait()
+	waitErr := cmd.Wait()
 	close(instance.Done)
 
-	go wrapperDown(&instance)
+	go wrapperDown(&instance, waitErr)
 }
 
+// handleOutput is the only place the wrapper's own words reach the manager. It
+// acts on four fixed markers; everything else used to be dropped after a debug
+// line that production never printed. Now every line is kept in the instance's
+// tail so a death can quote it, and logWrapperLine decides its level.
 func handleOutput(reader io.Reader, instance *WrapperInstance) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "__") || !strings.HasPrefix(line, "WARNING") {
-			log.Debug(fmt.Sprintf("[wrapper %s]", strings.Split(instance.Id, "-")[0]), line)
-		}
+		instance.proc.recordLine(line)
+		logWrapperLine(instance, line)
 
 		if strings.Contains(line, "Waiting for input...") {
 			go Login2FAHandler(instance.Id)
@@ -224,6 +228,7 @@ func handleOutput(reader io.Reader, instance *WrapperInstance) {
 }
 
 func wrapperReady(instance *WrapperInstance) {
+	wrapperFailures.clear(instance.Id)
 	storefrontID, err := os.ReadFile(fmt.Sprintf("data/wrapper/rootfs/data/instances/%s/STOREFRONT_ID", instance.Id))
 	if err != nil {
 		panic(err)
@@ -240,17 +245,56 @@ func wrapperReady(instance *WrapperInstance) {
 	}
 }
 
-func wrapperDown(instance *WrapperInstance) {
-	log.Info(fmt.Sprintf("[wrapper %s]", strings.Split(instance.Id, "-")[0]), " Wrapper Down")
+// wrapperDown runs once per wrapper death. It records what happened, then
+// decides whether restarting is still worth doing: the previous version
+// restarted unconditionally, which on 2026-07-29 meant four restarts in 52
+// seconds into the same immediate death, invisibly.
+func wrapperDown(instance *WrapperInstance, waitErr error) {
+	logWrapperExit(instance, waitErr)
+	tag := wrapperTag(instance.Id)
 	ReleasePort(instance.DecryptPort)
 	ReleasePort(instance.M3U8Port)
 	RemoveInstance(instance)
-	WMDispatcher.RemoveInstance(instance.Id)
-	if !instance.NoRestart {
-		go WrapperStart(instance.Id, instance.Account)
-	} else {
-		SaveInstances()
+	if WMDispatcher != nil {
+		WMDispatcher.RemoveInstance(instance.Id)
 	}
+
+	if instance.NoRestart {
+		abandonReplacement(instance.Id, "instance is not configured to restart")
+		SaveInstances()
+		return
+	}
+
+	now := time.Now()
+	decision := wrapperRestarts.plan(instance.Id, instance.proc.uptime(now), now)
+	if !decision.restart {
+		reason := fmt.Sprintf(
+			"crash loop: %d deaths in a row without staying up %s, %d restarts already spent within %s",
+			decision.deaths, wrapperHealthyUptime, wrapperRestartLimit, wrapperRestartWindow,
+		)
+		log.Errorf("%s not restarting it again — %s; the instance is marked failed and needs attention", tag, reason)
+		wrapperFailures.mark(WrapperFailure{
+			Id:       instance.Id,
+			Account:  instance.Account,
+			Reason:   reason,
+			At:       now,
+			Deaths:   decision.deaths,
+			Restarts: wrapperRestartLimit,
+		})
+		// A wedged instance elsewhere in the pool may be held in service waiting
+		// for this replacement. It is not coming.
+		abandonReplacement(instance.Id, reason)
+		return
+	}
+	if decision.delay > 0 {
+		log.Warnf("%s died after less than %s, %d times in a row; restarting in %s (%d of %d restarts spent)",
+			tag, wrapperHealthyUptime, decision.deaths, decision.delay, decision.deaths, wrapperRestartLimit)
+	} else if decision.shortLived {
+		log.Warnf("%s died after less than %s; restarting now", tag, wrapperHealthyUptime)
+	} else {
+		log.Infof("%s restarting now", tag)
+	}
+	startWrapper(instance.Id, instance.Account, decision.delay)
 }
 
 func KillWrapper(id string) error {
@@ -271,6 +315,10 @@ func signalWrapperInstance(instance *WrapperInstance) error {
 	if instance.Cmd.Process == nil {
 		return fmt.Errorf("instance %s process is nil", instance.Id)
 	}
+	// Recorded so the exit report can say whether anyone asked for this death.
+	// A wrapper leaving with status 0 that nobody signalled is the shape of the
+	// fault this manager exists to catch.
+	instance.proc.markStopRequested()
 	// Send SIGINT to trigger wrapper's internal child-killing signal handler
 	err := instance.Cmd.Process.Signal(os.Interrupt)
 	if err != nil {

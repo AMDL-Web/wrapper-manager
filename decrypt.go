@@ -20,13 +20,17 @@ type Dispatcher struct {
 	mu          sync.RWMutex
 	generation  map[string]uint64
 	newInstance func(*WrapperInstance) (*DecryptInstance, error)
-	// pendingReplacements counts instances that have been condemned and whose
-	// replacement has not registered yet. It exists so a second condemnation
-	// cannot take the pool to zero while the first wrapper is still coming
-	// back: a replacement was observed taking 72s on 2026-07-29, and the
-	// backend rejects every submission outright for as long as Status reports
-	// no instances. See canCondemn.
-	pendingReplacements int
+	// pendingReplacements maps the id of a condemned instance to the moment it
+	// was condemned. It exists so a second condemnation cannot take the pool to
+	// zero while the first wrapper is still coming back: a replacement was
+	// observed taking 72s on 2026-07-29, and the backend rejects every
+	// submission outright for as long as Status reports no instances.
+	//
+	// It is keyed by id, and the entry is cleared by the replacement for that
+	// same id registering, because a wrapper keeps its id across a restart. It
+	// stores a timestamp rather than a count because a replacement that never
+	// arrives must stop holding the gate. See canCondemn.
+	pendingReplacements map[string]time.Time
 
 	selectionMu sync.Mutex
 	roundRobin  uint64
@@ -35,16 +39,26 @@ type Dispatcher struct {
 	capacityCh chan struct{}
 
 	checkRegion regionAvailabilityFunc
+	now         func() time.Time
 }
 
 func NewDispatcher() *Dispatcher {
 	return &Dispatcher{
-		Instances:   make([]*DecryptInstance, 0),
-		generation:  make(map[string]uint64),
-		newInstance: NewDecryptInstance,
-		capacityCh:  make(chan struct{}),
-		checkRegion: checkAvailableOnRegionContext,
+		Instances:           make([]*DecryptInstance, 0),
+		generation:          make(map[string]uint64),
+		newInstance:         NewDecryptInstance,
+		pendingReplacements: make(map[string]time.Time),
+		capacityCh:          make(chan struct{}),
+		checkRegion:         checkAvailableOnRegionContext,
+		now:                 time.Now,
 	}
+}
+
+func (d *Dispatcher) clock() time.Time {
+	if d.now == nil {
+		return time.Now()
+	}
+	return d.now()
 }
 
 func (d *Dispatcher) signalCapacity() {
@@ -92,9 +106,8 @@ func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 		}
 	}
 	d.Instances = append(d.Instances, decryptInstance)
-	if d.pendingReplacements > 0 {
-		d.pendingReplacements--
-	}
+	delete(d.pendingReplacements, inst.Id)
+	d.prunePendingReplacementsLocked()
 	d.mu.Unlock()
 	if replaced != nil {
 		replaced.Close()
@@ -113,7 +126,8 @@ func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
 		if current == target {
 			d.generation[target.id]++
 			d.Instances = append(d.Instances[:i], d.Instances[i+1:]...)
-			d.pendingReplacements++
+			d.pendingReplacements[target.id] = d.clock()
+			d.prunePendingReplacementsLocked()
 			removed = true
 			break
 		}
@@ -124,9 +138,52 @@ func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
 	}
 }
 
+// ReplacementFailed reports that no replacement is coming for a condemned
+// instance — its wrapper crash-looped, or it is not restartable at all. It is
+// the fast path out of the hold in canCondemn: without it the gate would stay
+// shut until pendingReplacementGrace expires, which is pure waiting for an
+// answer the supervisor already knows.
+func (d *Dispatcher) ReplacementFailed(id string, reason string) {
+	d.mu.Lock()
+	_, waiting := d.pendingReplacements[id]
+	delete(d.pendingReplacements, id)
+	d.prunePendingReplacementsLocked()
+	d.mu.Unlock()
+	if !waiting {
+		return
+	}
+	logrus.Warnf("no replacement is coming for wrapper instance %s (%s); it no longer holds back condemning the instances that are left", id, reason)
+	d.signalCapacity()
+}
+
+func (d *Dispatcher) prunePendingReplacementsLocked() {
+	cutoff := d.clock().Add(-pendingReplacementGrace)
+	for id, since := range d.pendingReplacements {
+		if !since.After(cutoff) {
+			delete(d.pendingReplacements, id)
+		}
+	}
+}
+
+// pendingReplacementGrace bounds how long a condemned instance's replacement is
+// assumed to still be on its way, and so how long the hold in canCondemn can
+// last on a deadline alone.
+//
+// The slowest replacement measured is 72s (2026-07-29), so the bound has to
+// clear that; 120s is 1.7x it. It does not need more headroom than that,
+// because the supervisor calls ReplacementFailed the moment it gives up
+// restarting a wrapper, which releases the hold without waiting for the
+// deadline — the deadline only covers a replacement that is neither arriving
+// nor known to have failed. And erring short is the safer direction: the
+// instance being held is by definition already unhealthy, so while the hold
+// lasts the pool is not really serving anyway, and condemning it starts the
+// restart that is the only way back. Waiting decrypts are covered separately by
+// emptyPoolGrace.
+const pendingReplacementGrace = 120 * time.Second
+
 // canCondemn answers whether an unhealthy instance may be taken out of service
 // now. It may not, if doing so would empty the pool while a previous
-// condemnation's replacement is still starting.
+// condemnation's replacement is still plausibly starting.
 //
 // The alternative is what happened on 2026-07-29: two instances degraded 63s
 // apart, each was condemned on the evidence of its own failures, and for the
@@ -141,18 +198,32 @@ func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
 // next failure once a replacement has arrived. The one case that must still go
 // through is a pool with nothing pending — there, the unhealthy instance is the
 // only path forward and restarting it is the whole point.
+//
+// "Plausibly" is the word this gate was missing. Its first version assumed a
+// replacement always arrives, and on the very next incident one did not: the
+// replacement wrapper died on startup four times in 52 seconds, so the pending
+// slot never cleared, and a wedged instance serving nothing was held in service
+// indefinitely. A hold is therefore only honoured while the replacement is
+// either recent (pendingReplacementGrace) or not yet known to have failed
+// (ReplacementFailed). Protecting capacity that does not work is worse than
+// briefly having none.
 func (d *Dispatcher) canCondemn(target *DecryptInstance) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if d.pendingReplacements == 0 {
-		return true
-	}
 	for _, current := range d.Instances {
 		if current != nil && current != target {
 			return true
 		}
 	}
-	return false
+	// target is the last instance in service, so this condemnation empties the
+	// pool. Allow it unless a replacement could still be on its way.
+	cutoff := d.clock().Add(-pendingReplacementGrace)
+	for _, since := range d.pendingReplacements {
+		if since.After(cutoff) {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Dispatcher) RemoveInstance(id string) {

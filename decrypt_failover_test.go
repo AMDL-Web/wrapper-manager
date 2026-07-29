@@ -431,6 +431,95 @@ func liveInstances(d *Dispatcher) int {
 	return len(d.Instances)
 }
 
+// advanceDispatcherClock moves the dispatcher's view of time forward without
+// making the test wait for it. The hold on condemnation is bounded by a
+// deadline, and a deadline can only be tested by controlling the clock.
+func advanceDispatcherClock(d *Dispatcher, by time.Duration) {
+	base := d.clock()
+	d.now = func() time.Time { return base.Add(by) }
+}
+
+// TestAPendingReplacementCannotPinAWedgedInstanceForever is the other side of
+// TestPoolIsNeverEmptiedByStaggeredCondemnations, and the failure it describes
+// is what the gate itself caused on 2026-07-29: the first instance's
+// replacement crash-looped and never registered, so pendingReplacements never
+// returned to zero, and a known-wedged instance that was serving nothing was
+// deliberately held in service — five consecutive "keeping it until the pool
+// refills" messages with no replacement ever arriving.
+//
+// Protecting capacity is only worth it while the capacity being protected might
+// come back. Once no replacement can plausibly still be starting, the wedged
+// instance must be condemnable again, because restarting it is the only path
+// back to a working pool.
+func TestAPendingReplacementCannotPinAWedgedInstanceForever(t *testing.T) {
+	d, instances, _ := newTestDispatcherWithServers(t, 2, maxPoolSize)
+	wireHealthCallbacks(d, instances)
+
+	instances[0].Unavailable("first instance wedged")
+	if got := liveInstances(d); got != 1 {
+		t.Fatalf("live instances = %d after the first condemnation, want 1", got)
+	}
+
+	// The replacement never registers; its wrapper is dying on startup.
+	instances[1].Unavailable("second instance wedged")
+	if got := liveInstances(d); got != 1 {
+		t.Fatalf("live instances = %d, want 1 — the hold is correct while a "+
+			"replacement may still be starting", got)
+	}
+
+	advanceDispatcherClock(d, pendingReplacementGrace+time.Second)
+	instances[1].Unavailable("second instance still wedged")
+	if got := liveInstances(d); got != 0 {
+		t.Fatalf("live instances = %d, want 0 — a replacement that never arrived "+
+			"must not pin a wedged instance in service forever", got)
+	}
+}
+
+// TestAbandonedReplacementReleasesTheCondemnationGate covers the fast path out
+// of the same hold. Waiting out pendingReplacementGrace is only necessary while
+// nobody knows whether the replacement is coming; once the supervisor has given
+// up restarting that wrapper it does know, and holding the remaining instance
+// hostage for another two minutes serves nothing.
+func TestAbandonedReplacementReleasesTheCondemnationGate(t *testing.T) {
+	d, instances, _ := newTestDispatcherWithServers(t, 2, maxPoolSize)
+	wireHealthCallbacks(d, instances)
+
+	instances[0].Unavailable("first instance wedged")
+	instances[1].Unavailable("second instance wedged")
+	if got := liveInstances(d); got != 1 {
+		t.Fatalf("live instances = %d, want 1 while the replacement may still arrive", got)
+	}
+
+	d.ReplacementFailed(instances[0].id, "wrapper crash-looped on startup")
+	instances[1].Unavailable("second instance still wedged")
+	if got := liveInstances(d); got != 0 {
+		t.Fatalf("live instances = %d, want 0 — an abandoned replacement must "+
+			"release the gate immediately, not after the grace expires", got)
+	}
+}
+
+// TestReplacementClearsOnlyItsOwnPendingSlot pins the id keying. The counter
+// this map replaced was decremented by any instance registering, so an
+// unrelated arrival could settle a slot whose replacement was still missing —
+// and, worse, a second condemnation would then be allowed on the strength of a
+// wrapper that had nothing to do with it.
+func TestReplacementClearsOnlyItsOwnPendingSlot(t *testing.T) {
+	d, instances, _ := newTestDispatcherWithServers(t, 2, maxPoolSize)
+	wireHealthCallbacks(d, instances)
+
+	instances[0].Unavailable("first instance wedged")
+
+	server := newFakeDecryptServer(t)
+	d.AddInstance(&WrapperInstance{Id: "unrelated", Region: "us", DecryptPort: server.port()})
+
+	d.mu.RLock()
+	_, stillPending := d.pendingReplacements[instances[0].id]
+	d.mu.RUnlock()
+	if !stillPending {
+		t.Fatal("an unrelated instance registering settled another instance's pending replacement")
+	}
+}
+
 // TestPoolIsNeverEmptiedByStaggeredCondemnations pins the invariant that the
 // 2026-07-29 soak broke. Two instances degraded 63s apart and each was
 // condemned on its own evidence; the first replacement had not registered yet,
