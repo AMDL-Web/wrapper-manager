@@ -412,3 +412,100 @@ func TestFirstSampleWedgeIsCondemnedThroughDecrypt(t *testing.T) {
 		})
 	}
 }
+
+// wireHealthCallbacks attaches the callbacks that main wires in production but
+// newTestDispatcherWithServers leaves off: the quarantine handler and the gate
+// that stops it emptying the pool.
+func wireHealthCallbacks(d *Dispatcher, instances []*DecryptInstance) {
+	for _, instance := range instances {
+		instance := instance
+		instance.onUnavailable = d.quarantineInstance
+		instance.canCondemn = func() bool { return d.canCondemn(instance) }
+		instance.terminateWrapper = func() error { return nil }
+	}
+}
+
+func liveInstances(d *Dispatcher) int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.Instances)
+}
+
+// TestPoolIsNeverEmptiedByStaggeredCondemnations pins the invariant that the
+// 2026-07-29 soak broke. Two instances degraded 63s apart and each was
+// condemned on its own evidence; the first replacement had not registered yet,
+// so for nine seconds there were no instances, and because the backend checks
+// decryptor status before accepting a submission that window failed 13 jobs
+// outright rather than merely delaying them.
+func TestPoolIsNeverEmptiedByStaggeredCondemnations(t *testing.T) {
+	d, instances, _ := newTestDispatcherWithServers(t, 2, maxPoolSize)
+	wireHealthCallbacks(d, instances)
+
+	instances[0].Unavailable("first instance wedged")
+	if got := liveInstances(d); got != 1 {
+		t.Fatalf("live instances = %d after the first condemnation, want 1", got)
+	}
+
+	// The second instance is just as unhealthy, but taking it now would leave
+	// nothing serving while the first replacement is still starting.
+	instances[1].Unavailable("second instance wedged")
+	if got := liveInstances(d); got != 1 {
+		t.Fatalf("live instances = %d after the second condemnation, want 1 — "+
+			"the pool must not empty while a replacement is pending", got)
+	}
+
+	// The replacement registers, which settles the pending slot.
+	server := newFakeDecryptServer(t)
+	d.AddInstance(&WrapperInstance{Id: "replacement", Region: "us", DecryptPort: server.port()})
+	if got := liveInstances(d); got != 2 {
+		t.Fatalf("live instances = %d after the replacement registered, want 2", got)
+	}
+
+	// Now the deferred condemnation must go through: declining it must not have
+	// consumed the one shot.
+	instances[1].Unavailable("second instance still wedged")
+	if got := liveInstances(d); got != 1 {
+		t.Fatalf("live instances = %d after the deferred condemnation, want 1 — "+
+			"a declined condemnation must be retryable", got)
+	}
+}
+
+// TestASoleInstanceIsStillCondemned is the other half. Refusing to condemn the
+// last instance unconditionally would mean a single wedged wrapper could never
+// be restarted, which is the bug the health rules exist to catch.
+func TestASoleInstanceIsStillCondemned(t *testing.T) {
+	d, instances, _ := newTestDispatcherWithServers(t, 1, maxPoolSize)
+	wireHealthCallbacks(d, instances)
+
+	instances[0].Unavailable("the only instance is wedged")
+	if got := liveInstances(d); got != 0 {
+		t.Fatalf("live instances = %d, want 0 — with nothing pending, restarting "+
+			"the only instance is the whole point", got)
+	}
+}
+
+// TestDecryptWaitsForAnInstanceInsteadOfFailing covers the total-loss case that
+// canCondemn cannot prevent: every wrapper really is gone. A decrypt arriving
+// then used to fail instantly, though the pool refills in seconds.
+func TestDecryptWaitsForAnInstanceInsteadOfFailing(t *testing.T) {
+	d, instances, _ := newTestDispatcherWithServers(t, 1, maxPoolSize)
+	wireHealthCallbacks(d, instances)
+	instances[0].Unavailable("total loss")
+	if got := liveInstances(d); got != 0 {
+		t.Fatalf("live instances = %d, want 0", got)
+	}
+
+	server := newFakeDecryptServer(t)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		d.AddInstance(&WrapperInstance{Id: "replacement", Region: "us", DecryptPort: server.port()})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	session, err := d.OpenSession(ctx, "song-1", "key-1")
+	if err != nil {
+		t.Fatalf("OpenSession on an empty pool = %v, want it to wait for the replacement", err)
+	}
+	session.Close()
+}

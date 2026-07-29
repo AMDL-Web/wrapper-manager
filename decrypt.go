@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -19,6 +20,13 @@ type Dispatcher struct {
 	mu          sync.RWMutex
 	generation  map[string]uint64
 	newInstance func(*WrapperInstance) (*DecryptInstance, error)
+	// pendingReplacements counts instances that have been condemned and whose
+	// replacement has not registered yet. It exists so a second condemnation
+	// cannot take the pool to zero while the first wrapper is still coming
+	// back: a replacement was observed taking 72s on 2026-07-29, and the
+	// backend rejects every submission outright for as long as Status reports
+	// no instances. See canCondemn.
+	pendingReplacements int
 
 	selectionMu sync.Mutex
 	roundRobin  uint64
@@ -67,6 +75,7 @@ func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 	}
 	decryptInstance.onCapacity = d.signalCapacity
 	decryptInstance.onUnavailable = d.quarantineInstance
+	decryptInstance.canCondemn = func() bool { return d.canCondemn(decryptInstance) }
 
 	var replaced *DecryptInstance
 	d.mu.Lock()
@@ -83,6 +92,9 @@ func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 		}
 	}
 	d.Instances = append(d.Instances, decryptInstance)
+	if d.pendingReplacements > 0 {
+		d.pendingReplacements--
+	}
 	d.mu.Unlock()
 	if replaced != nil {
 		replaced.Close()
@@ -101,6 +113,7 @@ func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
 		if current == target {
 			d.generation[target.id]++
 			d.Instances = append(d.Instances[:i], d.Instances[i+1:]...)
+			d.pendingReplacements++
 			removed = true
 			break
 		}
@@ -109,6 +122,37 @@ func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
 	if removed {
 		d.signalCapacity()
 	}
+}
+
+// canCondemn answers whether an unhealthy instance may be taken out of service
+// now. It may not, if doing so would empty the pool while a previous
+// condemnation's replacement is still starting.
+//
+// The alternative is what happened on 2026-07-29: two instances degraded 63s
+// apart, each was condemned on the evidence of its own failures, and for the
+// nine seconds between the second condemnation and the first replacement
+// registering there were no instances at all. The backend checks decryptor
+// status before it accepts a submission, so that window did not merely slow
+// downloads down — it failed 13 jobs outright with "decryptor is not ready",
+// before any track was attempted.
+//
+// Keeping a known-bad instance in service is the lesser harm: a decrypt it
+// fails is failed over to another instance, and this one is condemned on its
+// next failure once a replacement has arrived. The one case that must still go
+// through is a pool with nothing pending — there, the unhealthy instance is the
+// only path forward and restarting it is the whole point.
+func (d *Dispatcher) canCondemn(target *DecryptInstance) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.pendingReplacements == 0 {
+		return true
+	}
+	for _, current := range d.Instances {
+		if current != nil && current != target {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Dispatcher) RemoveInstance(id string) {
@@ -255,7 +299,18 @@ func (d *Dispatcher) openSession(ctx context.Context, adamId, key string, exclud
 		capacityCh := d.capacitySignal()
 		instances := d.snapshotInstances()
 		if len(instances) == 0 {
-			return nil, errors.New("no available instance")
+			// Every instance is restarting. The pool refills in seconds and
+			// AddInstance signals capacity, so wait for one rather than failing
+			// a decrypt that would have succeeded moments later. Bounded, so a
+			// manager with no wrappers at all still answers instead of hanging.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-capacityCh:
+				continue
+			case <-time.After(emptyPoolGrace):
+				return nil, errors.New("no available instance")
+			}
 		}
 		available, err := d.availableInstances(ctx, adamId, instances)
 		if err != nil {

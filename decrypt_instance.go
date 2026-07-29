@@ -74,6 +74,14 @@ const (
 	firstSampleStage = "first decrypt after context switch"
 )
 
+// emptyPoolGrace is how long a decrypt waits for an instance when every one of
+// them is restarting, before giving up. A replacement took 72s on 2026-07-29,
+// but Dispatcher.canCondemn now keeps the pool from emptying in the first
+// place, so this only covers a total loss — where waiting out a full restart
+// still beats failing, and where a manager with no wrappers configured at all
+// must still answer rather than hang.
+const emptyPoolGrace = 90 * time.Second
+
 // The effective deadlines, overridable at startup by -decrypt-timeout and
 // -first-sample-timeout for hosts slower than the benchmarked ones.
 var (
@@ -142,8 +150,11 @@ type DecryptInstance struct {
 	firstSampleTimeout time.Duration
 	onCapacity         func()
 	onUnavailable      func(*DecryptInstance, string)
-	terminateWrapper   func() error
-	now                func() time.Time
+	// canCondemn reports whether this instance may be taken out of service now.
+	// Nil means unconditionally; see Dispatcher.canCondemn for why it is not.
+	canCondemn       func() bool
+	terminateWrapper func() error
+	now              func() time.Time
 
 	healthMu sync.Mutex
 	failures []wrapperIOFailure
@@ -367,6 +378,13 @@ func (d *DecryptInstance) Close() {
 }
 
 func (d *DecryptInstance) Unavailable(reason string) {
+	// Deliberately outside unavailableOnce: a declined condemnation must not
+	// consume the one shot, or the instance could never be condemned once a
+	// replacement has arrived.
+	if d.canCondemn != nil && !d.canCondemn() {
+		logrus.Warnf("wrapper instance %s is unhealthy (%s) but is the last one serving while a replacement is still starting; keeping it until the pool refills", d.id, reason)
+		return
+	}
 	d.unavailableOnce.Do(func() {
 		// Closing first immediately removes this instance from scheduling and
 		// interrupts every leased connection. The wrapper lifecycle will replace
