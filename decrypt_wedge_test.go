@@ -385,3 +385,36 @@ func TestFailedFirstSampleIsNotRecordedAsKeySetupLatency(t *testing.T) {
 	}
 	ok.Close()
 }
+
+// The last hop before wrapper.go: a line from one wrapper's stdout must reach
+// that wrapper's DecryptInstance and no other. Instances share a manager
+// process, so a routing mistake here would condemn the wrong one — and the
+// evidence that names this fault only exists on this path.
+func TestWrapperOutputIsRoutedToTheRightInstance(t *testing.T) {
+	d := NewDispatcher()
+	mine := &DecryptInstance{id: "mine", connections: make(map[*decryptConn]struct{})}
+	other := &DecryptInstance{id: "other", connections: make(map[*decryptConn]struct{})}
+	d.Instances = []*DecryptInstance{mine, other}
+
+	d.ObserveWrapperLine("mine", "[.] adamId: 1, uri: skd://a")
+	d.ObserveWrapperLine("mine", "[!] catched an exception: Invalid CKC error. ")
+
+	if got := mine.keySetupAnnounces(); got != 1 {
+		t.Fatalf("announces on the addressed instance = %d, want 1", got)
+	}
+	if _, _, ok := mine.stranded(); !ok {
+		t.Fatal("the exception did not reach the addressed instance")
+	}
+	if got := other.keySetupAnnounces(); got != 0 {
+		t.Fatalf("announces leaked to the other instance = %d, want 0", got)
+	}
+	if _, _, ok := other.stranded(); ok {
+		t.Fatal("one wrapper's exception was recorded against another instance")
+	}
+
+	// An unknown id must be dropped rather than broadcast.
+	d.ObserveWrapperLine("gone", "[!] catched an exception: Invalid CKC error. ")
+	if _, _, ok := other.stranded(); ok {
+		t.Fatal("a line for an unregistered wrapper was applied to a live instance")
+	}
+}
