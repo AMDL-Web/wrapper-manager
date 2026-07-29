@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -45,12 +47,30 @@ const (
 	// operations sitting on the 10 s deadline itself, so that run had simply not
 	// seen the tail. This population has no characterised ceiling.
 	//
-	// Thirty seconds is where this deadline started, and in that form it never
-	// misfired. Since a timeout here no longer counts against instance health,
-	// the only thing a budget this wide costs is how long one operation per track
-	// waits before failing over — and cutting it is what turned legitimate slow
-	// operations into restarts of healthy wrappers.
-	defaultFirstSampleIOTimeout = 30 * time.Second
+	// It must nonetheless be strictly below the *backend's* wrapper timeout, and
+	// that is the constraint this value now exists to satisfy. Both were 30 s,
+	// and the backend's clock starts first: its timer opens at DecryptFragment,
+	// while `started` below is taken after the gRPC send, the Recv, the pool
+	// reservation and the context-switch write. So the backend always won the
+	// race, every stalled first sample was cancelled from above, and — because
+	// classifyLocalWrapperIOError discounts anything with a cancelled context —
+	// the entire first-sample health apparatus below was unreachable. Forty-two
+	// consecutive stalls on a dead wrapper produced zero condemnations and zero
+	// log lines while Status kept advertising the instance as available.
+	//
+	// The margin is measured, not guessed. Those 42 stalls on 2026-07-29/30
+	// landed at 28.298 s - 29.740 s against the backend's 30 s, never once on
+	// this deadline, which puts the manager's lead-in at 260 ms - 1.702 s
+	// (median 412 ms) under a heavily loaded pool.
+	//
+	// Twenty-five seconds is therefore ~2.9x the worst lead-in ever observed
+	// clear of the backend, so the manager reliably fires first and owns the
+	// verdict. Erring the other way is what the old value did and it hid the
+	// fault completely. Cutting further is the mistake this deadline has already
+	// made twice: the slowest first sample from a healthy instance is 10.02 s,
+	// so 25 s keeps 2.5x over the real population, and a timeout here with an
+	// empty read still needs wrapperTimeoutThreshold of them to condemn.
+	defaultFirstSampleIOTimeout = 25 * time.Second
 	maxPoolSize                 = 10
 	wrapperFailureWindow        = 60 * time.Second
 	wrapperFailureThreshold     = 3
@@ -72,6 +92,31 @@ const (
 	// firstSampleStage names the operation whose timeouts are routed only to
 	// the streak rule; observeWrapperIOFailure compares against it.
 	firstSampleStage = "first decrypt after context switch"
+	// firstSampleCancelEvidence is how long a first decrypt must have been
+	// waiting, having read nothing at all, before a cancellation from above is
+	// treated as evidence about the wrapper rather than about the client.
+	//
+	// classifyLocalWrapperIOError discounts every error whose context is already
+	// cancelled, and it is right to: normally the client went away and the
+	// manager never learned what the wrapper would have done. But that guard is
+	// exactly what made the 2026-07-29/30 wedge invisible. Forty-two first
+	// samples stalled on a dead wrapper, all of them cancelled by the backend at
+	// its own 30 s, and every one was discarded here before it could reach a
+	// rule — condemned: 0 after forty minutes, while a third of all tracks kept
+	// being routed into the dead instance.
+	//
+	// Lowering defaultFirstSampleIOTimeout means the manager should now win that
+	// race, so this is a backstop rather than the primary fix; it still matters,
+	// because anything that cancels earlier than 25 s would otherwise restore
+	// the same blindness.
+	//
+	// Fifteen seconds because the slowest first sample ever seen from a healthy
+	// instance is 10.02 s. Past that, with zero bytes back, it makes no
+	// difference who stopped waiting first: the wrapper had fifteen seconds to
+	// produce one byte and produced none. Kept as narrow as the evidence — first
+	// samples only, empty reads only, and it still only feeds the streak rule,
+	// which resets the moment any first sample completes.
+	firstSampleCancelEvidence = 15 * time.Second
 )
 
 // emptyPoolGrace is how long a decrypt waits for an instance when every one of
@@ -119,13 +164,20 @@ type DecryptSession struct {
 	ctx        context.Context
 	stopCancel func() bool
 	adamID     string
-	// Three populations, kept apart because they are not interchangeable when
-	// sizing the deadline: the context-switch write itself, the first decrypt
-	// after one (where the wrapper's key setup is expected to land), and every
-	// other decrypt.
-	switchLatency sampleLatency
-	firstLatency  sampleLatency
-	latency       sampleLatency
+	// Populations, kept apart because they are not interchangeable when sizing
+	// the deadline: the context-switch write itself, the first decrypt after one
+	// (where the wrapper's key setup is expected to land), and every other
+	// decrypt.
+	//
+	// Successes and failures are also kept apart. An operation that failed
+	// measures how long the manager waited before giving up on it, not how long
+	// the wrapper takes to do the work, and the two are only superficially the
+	// same shape.
+	switchLatency      sampleLatency
+	firstLatency       sampleLatency
+	firstFailedLatency sampleLatency
+	latency            sampleLatency
+	failedLatency      sampleLatency
 
 	mu     sync.Mutex
 	closed bool
@@ -135,6 +187,116 @@ type instanceLoad struct {
 	inUse       int
 	hasCapacity bool
 	contextHit  bool
+}
+
+const (
+	// keySetupAnnounceMarker is printed by the wrapper from *inside* the lock
+	// that serialises its key setup, once per context it takes up. That placement
+	// is what makes it useful: an attempt that never produces one never reached
+	// the lock.
+	keySetupAnnounceMarker = "[.] adamId:"
+	// wrapperExceptionMarker is the wrapper throwing out of its key-setup path.
+	// The lock above is taken with no landing pad on the throw path, so an
+	// exception leaks it permanently and every later key setup on that process
+	// blocks forever — while it keeps accepting connections, keeps starting
+	// decrypt worker threads, and keeps reporting itself ready. On 2026-07-29 an
+	// "Invalid CKC error" at 17:12:33 was followed by exactly zero announces for
+	// the remaining fourteen minutes of that wrapper's life.
+	wrapperExceptionMarker = "[!] catched an exception"
+)
+
+// wrapperKeySetupWitness watches a wrapper's own stdout for the two markers that
+// describe the state of its key-setup lock. It is the only signal that separates
+// this fault from a slow instance: readiness stays true, connections keep being
+// accepted, and the decrypt path just silently never answers.
+type wrapperKeySetupWitness struct {
+	announces atomic.Uint64
+
+	mu sync.Mutex
+	// strandedBy is the exception line seen with no announce after it. Cleared by
+	// the next announce, because a wrapper that took the lock again plainly did
+	// not leak it.
+	strandedBy string
+	strandedAt time.Time
+}
+
+func (w *wrapperKeySetupWitness) observeLine(line string, now time.Time) {
+	switch {
+	case strings.Contains(line, keySetupAnnounceMarker):
+		w.announces.Add(1)
+		w.mu.Lock()
+		w.strandedBy, w.strandedAt = "", time.Time{}
+		w.mu.Unlock()
+	case strings.Contains(line, wrapperExceptionMarker):
+		w.mu.Lock()
+		// Keep the first one. It is the throw that leaked the lock; anything
+		// after it is a consequence.
+		if w.strandedBy == "" {
+			w.strandedBy, w.strandedAt = strings.TrimSpace(line), now
+		}
+		w.mu.Unlock()
+	}
+}
+
+func (w *wrapperKeySetupWitness) stranded() (string, time.Time, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.strandedBy, w.strandedAt, w.strandedBy != ""
+}
+
+func (d *DecryptInstance) keySetupAnnounces() uint64 {
+	return d.keySetupWitness.announces.Load()
+}
+
+// ObserveWrapperLine feeds one line of the wrapper's stdout to the witness.
+func (d *DecryptInstance) ObserveWrapperLine(line string) {
+	now := time.Now()
+	if d.now != nil {
+		now = d.now()
+	}
+	d.keySetupWitness.observeLine(line, now)
+}
+
+// observeSilentKeySetup condemns an instance whose wrapper is blocked in key
+// setup rather than merely slow at it.
+//
+// All three conditions have to hold, and together they are unambiguous:
+//
+//	the first decrypt failed having read zero bytes  (the caller checks this)
+//	the wrapper printed no announce during the attempt
+//	the wrapper has thrown, with no announce since
+//
+// The middle one alone is not enough — under legitimate contention another
+// session may simply hold the lock — and the last one alone is not enough
+// either, since a wrapper can throw and recover. Together they say the process
+// took an exception out of its key-setup path and has not acquired the lock
+// since, which is the leak, and no amount of waiting fixes it.
+//
+// This deliberately does not consult classifyLocalWrapperIOError. The evidence
+// is the wrapper's own output, not the shape of our I/O error, so it survives
+// the client having cancelled — which is the state every one of the 42 stalled
+// samples was in.
+//
+// One observation is enough. The general rules need repetition because their
+// evidence is ambiguous; this evidence is not, and the only recovery from a
+// leaked lock inside third-party code is to restart the process.
+func (d *DecryptInstance) observeSilentKeySetup(announcesBefore uint64, adamID string, elapsed time.Duration) {
+	if d.keySetupAnnounces() != announcesBefore {
+		// Something took the lock during this attempt, so it is not held forever.
+		return
+	}
+	line, at, ok := d.stranded()
+	if !ok {
+		return
+	}
+	d.Unavailable(fmt.Sprintf(
+		"wrapper is blocked in key setup: it threw at %s (%s) and has not announced a single %q since, while a first decrypt for Adam ID %s returned nothing in %s",
+		at.Format(time.RFC3339), line, keySetupAnnounceMarker, adamID, elapsed.Round(time.Millisecond),
+	))
+}
+
+func (d *DecryptInstance) stranded() (string, time.Time, bool) {
+	return d.keySetupWitness.stranded()
 }
 
 type DecryptInstance struct {
@@ -158,6 +320,11 @@ type DecryptInstance struct {
 	canCondemn       func() bool
 	terminateWrapper func() error
 	now              func() time.Time
+
+	// keySetupWitness carries what the wrapper said about its own key-setup lock.
+	// Independent of every I/O-derived signal, which is the point: it still
+	// reports when the client owned the deadline and our own error says nothing.
+	keySetupWitness wrapperKeySetupWitness
 
 	healthMu sync.Mutex
 	failures []wrapperIOFailure
@@ -459,7 +626,14 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 		return nil, err
 	}
 	switched := false
+	// The wrapper announces "[.] adamId: ..." from inside the lock that
+	// serialises its key setup, so an attempt that produces no new announce
+	// never reached that lock. Only read inside the branch: steady-state
+	// decrypts trigger no announce and there are thousands of them per track.
+	// See observeSilentKeySetup.
+	var announcesBefore uint64
 	if c.lastAdamId != adamId || c.lastKey != key {
+		announcesBefore = s.instance.keySetupAnnounces()
 		switchStarted := time.Now()
 		switchErr := s.instance.switchConnContext(s.ctx, c, adamId, key)
 		s.switchLatency.observe(time.Since(switchStarted))
@@ -467,7 +641,7 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 			// The switch is a pure write, measured at 25-131 µs, so its budget is
 			// four orders of magnitude clear of the distribution: a timeout here
 			// really does mean the wrapper stopped reading.
-			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", true, switchErr)
+			s.instance.observeWrapperIOFailure(s.ctx, c, adamId, "context switch", true, 0, switchErr)
 			local, _ := classifyLocalWrapperIOError(s.ctx, switchErr)
 			s.Discard()
 			// The sample was never written to the wrapper, so it is always
@@ -487,15 +661,23 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	started := time.Now()
 	result, read, err := s.instance.decryptConn(s.ctx, c, payload, payload, budget)
 	elapsed := time.Since(started)
-	if switched {
+	// Successes and failures go to different populations. Recording both as
+	// "latency" is how 42 stalls that decrypted nothing at all came to be
+	// reported as 29.5 s key setups, which is a time-to-failure wearing the
+	// costume of a measurement — and reading a concurrency curve off it
+	// manufactured a cliff that does not exist.
+	switch {
+	case switched && err == nil:
 		s.firstLatency.observe(elapsed)
-		if err == nil {
-			// This instance can still complete a key setup, however slowly, so
-			// whatever timeouts preceded this were slowness and not a wedge.
-			s.instance.resetFirstSampleFailures()
-		}
-	} else {
+		// This instance can still complete a key setup, however slowly, so
+		// whatever timeouts preceded this were slowness and not a wedge.
+		s.instance.resetFirstSampleFailures()
+	case switched:
+		s.firstFailedLatency.observe(elapsed)
+	case err == nil:
 		s.latency.observe(elapsed)
+	default:
+		s.failedLatency.observe(elapsed)
 	}
 	if err != nil {
 		stage, conclusive := "decrypt", true
@@ -504,8 +686,11 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 			// merely exceeding the budget says nothing — except when the
 			// wrapper produced no bytes at all. See observeWrapperIOFailure.
 			stage, conclusive = firstSampleStage, read == 0
+			if read == 0 {
+				s.instance.observeSilentKeySetup(announcesBefore, adamId, elapsed)
+			}
 		}
-		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, stage, conclusive, err)
+		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, stage, conclusive, elapsed, err)
 		local, _ := classifyLocalWrapperIOError(s.ctx, err)
 		s.Discard()
 		return nil, s.fault(mapContextError(s.ctx, err), local, read == 0)
@@ -598,8 +783,20 @@ func (d *DecryptInstance) observeWrapperTimeout(now, cutoff time.Time, firstSamp
 // wrapperTimeoutThreshold still requires two of them inside the window before
 // the instance is declared wedged. The sample is not lost either way; the
 // caller fails it over.
-func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, timeoutIsConclusive bool, err error) {
+func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, timeoutIsConclusive bool, elapsed time.Duration, err error) {
 	local, timedOut := classifyLocalWrapperIOError(ctx, err)
+	firstSample := stage == firstSampleStage
+	// One narrow exception to the cancellation guard, and it is the one that
+	// made the 2026-07-29/30 wedge produce no evidence at all. A first decrypt
+	// that has returned zero bytes after firstSampleCancelEvidence says
+	// something about the wrapper whoever stopped waiting first: the client
+	// giving up does not retroactively make fifteen seconds of silence normal.
+	// timeoutIsConclusive already carries read == 0 for this stage, so a partial
+	// read still means the wrapper is talking and still counts for nothing.
+	if !local && firstSample && timeoutIsConclusive && elapsed >= firstSampleCancelEvidence {
+		local, timedOut = true, true
+		logrus.Warnf("wrapper instance %s produced nothing for %s on a %s for Adam ID %s before the caller gave up; counting it against instance health anyway", d.id, elapsed.Round(time.Millisecond), stage, adamID)
+	}
 	if conn == nil || adamID == "" || !local {
 		return
 	}
@@ -609,7 +806,6 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 	if closed {
 		return
 	}
-	firstSample := stage == firstSampleStage
 	if timedOut && !timeoutIsConclusive {
 		logrus.Warnf("wrapper instance %s local %s exceeded its %s budget for Adam ID %s; failing the sample over without counting it against instance health: %v", d.id, stage, d.firstSampleTimeout, adamID, err)
 		return

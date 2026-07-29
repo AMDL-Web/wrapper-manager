@@ -122,8 +122,17 @@ func (s *sampleLatency) log(kind, instanceID, adamID string) {
 // logLatency reports each population separately. Keeping them apart is the
 // point: a mean taken across all of them is what produced a deadline 1.8x
 // above its own worst case rather than the thousandfold the mean suggested.
+//
+// Failures are reported under their own kinds, and that separation is now
+// load-bearing for anything reading these lines. A stalled first sample is not a
+// slow key setup; it is how long the manager waited before giving up on one that
+// never happened. Logging both as "first-after-switch" is what let 42 events
+// that decrypted nothing be read as latency, and a concurrency curve built from
+// them showed a cliff that was really just the failure population.
 func (s *DecryptSession) logLatency() {
 	s.switchLatency.log("context-switch", s.instance.id, s.adamID)
 	s.firstLatency.log("first-after-switch", s.instance.id, s.adamID)
+	s.firstFailedLatency.log("first-after-switch-failed", s.instance.id, s.adamID)
 	s.latency.log("steady", s.instance.id, s.adamID)
+	s.failedLatency.log("steady-failed", s.instance.id, s.adamID)
 }

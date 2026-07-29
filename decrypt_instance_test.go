@@ -520,6 +520,7 @@ func TestConcurrentWrapperIOTimeoutsScheduleSingleTermination(t *testing.T) {
 				fmt.Sprintf("song-%d", i),
 				"decrypt",
 				true,
+				0,
 				fakeTimeoutError{},
 			)
 		}(i)
@@ -592,7 +593,7 @@ func TestRepeatedConnectionFailuresAcrossSongsQuarantineOnce(t *testing.T) {
 		return nil
 	}
 	for i, adamID := range []string{"song-1", "song-1", "song-2"} {
-		instance.observeWrapperIOFailure(context.Background(), &decryptConn{}, adamID, "decrypt", true, io.EOF)
+		instance.observeWrapperIOFailure(context.Background(), &decryptConn{}, adamID, "decrypt", true, 0, io.EOF)
 		if i < 2 {
 			select {
 			case <-terminated:
@@ -737,7 +738,7 @@ func TestEmptyFirstSampleTimeoutCondemnsTheInstance(t *testing.T) {
 			for i := 0; i < wrapperTimeoutThreshold; i++ {
 				instance.observeWrapperIOFailure(
 					context.Background(), conn,
-					fmt.Sprintf("adam-%d", i), tc.stage, tc.conclusive,
+					fmt.Sprintf("adam-%d", i), tc.stage, tc.conclusive, 0,
 					&net.OpError{Op: "read", Err: &timeoutError{}},
 				)
 			}

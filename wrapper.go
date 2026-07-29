@@ -212,6 +212,13 @@ func handleOutput(reader io.Reader, instance *WrapperInstance) {
 		instance.proc.recordLine(line)
 		logWrapperLine(instance, line)
 
+		// The decrypt side needs two of these markers to tell a wrapper that is
+		// blocked in key setup from one that is slow at it. Routed rather than
+		// acted on here, because the verdict belongs with the decrypt evidence.
+		if WMDispatcher != nil {
+			WMDispatcher.ObserveWrapperLine(instance.Id, line)
+		}
+
 		if strings.Contains(line, "Waiting for input...") {
 			go Login2FAHandler(instance.Id)
 		}

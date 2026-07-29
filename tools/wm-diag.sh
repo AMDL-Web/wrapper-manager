@@ -6,10 +6,20 @@
 #   deaths      The 2026-07-29 outage looked like four separate failures. It was
 #               one 26-second window. Deaths are only meaningful with their exit
 #               tail and whether the manager asked for it, so they print together.
-#   cliff       The root cause was a concurrency cliff in the wrapper's key-setup
-#               path: latency is flat to ~6 concurrent setups per instance and
-#               collapses past ~10. Nothing else in the logs shows it; you have to
-#               reconstruct the overlaps. This is the section that found it.
+#   wedge       The root cause. The wrapper serialises all key setup behind one
+#               global mutex and leaks it if its key-setup path throws, so a
+#               single exception strands every later key setup on that process
+#               forever — while it keeps accepting connections and reporting
+#               Ready. Nothing in the I/O errors shows this; the wrapper's own
+#               announce line does, because it is printed from inside the lock.
+#
+#               This replaces the old `cliff` section, which reported a
+#               concurrency cliff that does not exist. It derived each key
+#               setup's interval as [end - duration, end], so long samples
+#               overlapped by construction and "overlap" was just duration said
+#               twice. Ten strictly sequential single-track jobs later failed 4
+#               of 10 with one key setup in flight at a time. `cliff` still works
+#               as an alias, and prints a pointer.
 #   fallback    A silent AAC-LC downgrade is what the owner actually notices. It
 #               is a backend event, not a manager one, so it is queried separately.
 #   health      Condemnations and the gate. Distinguishes "the manager killed it"
@@ -17,7 +27,7 @@
 #               investigation turned on and the logs could not answer at the time.
 #
 # Usage:  ./wm-diag.sh [since]        e.g. ./wm-diag.sh 6h   (default 1h)
-#         ./wm-diag.sh 12h cliff      run one section only
+#         ./wm-diag.sh 12h wedge      run one section only
 #
 # Reads production over ssh. Read-only: it never restarts or reconfigures
 # anything. rog is a Windows host, so every remote call goes through
@@ -72,8 +82,10 @@ if sec health; then
   echo
 fi
 
-if sec cliff; then
-  python3 "$HERE/wm-analyze.py" cliff < "$LOG"
+if sec wedge || [ "$ONLY" = cliff ]; then
+  # Never pass "all" here: the instances section above already ran.
+  [ "$ONLY" = cliff ] && want=cliff || want=wedge
+  python3 "$HERE/wm-analyze.py" "$want" < "$LOG"
 fi
 
 if sec fallback; then

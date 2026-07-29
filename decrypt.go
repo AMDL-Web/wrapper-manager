@@ -116,6 +116,25 @@ func (d *Dispatcher) AddInstance(inst *WrapperInstance) {
 	logrus.Debugf("added instance %s", inst.Id)
 }
 
+// ObserveWrapperLine routes one line of a wrapper's stdout to the DecryptInstance
+// serving that wrapper. The decrypt side cannot see the process's output on its
+// own, and that output carries the only direct evidence of a leaked key-setup
+// lock — see wrapperKeySetupWitness.
+//
+// Lines arriving before the instance is registered, or after it is condemned,
+// have nowhere to go and are dropped: a fresh DecryptInstance starts with a
+// clean witness, which is correct, since a restarted wrapper has a fresh lock.
+func (d *Dispatcher) ObserveWrapperLine(id, line string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, current := range d.Instances {
+		if current != nil && current.id == id {
+			current.ObserveWrapperLine(line)
+			return
+		}
+	}
+}
+
 func (d *Dispatcher) quarantineInstance(target *DecryptInstance, _ string) {
 	if target == nil {
 		return
