@@ -128,6 +128,18 @@ func (s *fakeDecryptServer) serveConn(conn net.Conn) {
 			if string(payload) == "block" {
 				continue
 			}
+			// Bytes come back and then the wrapper stalls. This is the shape a
+			// genuinely slow instance produces, and the only thing that tells it
+			// apart from a wedge at the deadline: the client's ReadFull times out
+			// having read something. Distinct from "partial", which closes.
+			if string(payload) == "partial-block" {
+				half := make([]byte, len(payload)/2)
+				for i := range half {
+					half[i] = 0xAA
+				}
+				_, _ = conn.Write(half)
+				continue
+			}
 			if string(payload) == "partial" {
 				partial := append([]byte(nil), payload[:len(payload)/2]...)
 				for i := range partial {
@@ -659,3 +671,92 @@ func TestDecryptSuccessUsesPerRequestStorage(t *testing.T) {
 		t.Fatalf("first reply changed after the next decrypt: %x", firstResult)
 	}
 }
+
+// TestEmptyFirstSampleTimeoutCondemnsTheInstance is the 2026-07-29 outage as a
+// test. Two wrapper instances stopped answering first-sample reads entirely,
+// failed over to each other for an hour, and were never restarted, because every
+// first-decrypt-after-context-switch timeout was excluded from the health rules
+// on the grounds that the operation is slow by nature.
+//
+// It is, but the two populations are distinguishable and the code already had
+// the discriminator to hand: a slow operation completes or stalls partway
+// through a reply, while a wedged one returns nothing at all. The table below is
+// that distinction, and the middle case is the false positive the exclusion was
+// added to prevent — it must stay excluded.
+func TestEmptyFirstSampleTimeoutCondemnsTheInstance(t *testing.T) {
+	tests := []struct {
+		name       string
+		stage      string
+		conclusive bool
+		wantWedged bool
+	}{
+		{
+			name:       "first sample, nothing read: the wedge",
+			stage:      "first decrypt after context switch",
+			conclusive: true, // read == 0
+			wantWedged: true,
+		},
+		{
+			name:       "first sample, partial read: genuinely slow, must not condemn",
+			stage:      "first decrypt after context switch",
+			conclusive: false, // read > 0
+			wantWedged: false,
+		},
+		{
+			name:       "steady-state decrypt: conclusive as it always was",
+			stage:      "decrypt",
+			conclusive: true,
+			wantWedged: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newFakeDecryptServer(t)
+			instance, err := NewDecryptInstance(&WrapperInstance{Id: "wedge-probe", Region: "cn", DecryptPort: server.port()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminated := make(chan struct{}, 4)
+			instance.terminateWrapper = func() error {
+				terminated <- struct{}{}
+				return nil
+			}
+			session, err := instance.OpenSession(context.Background(), "song-1", "key-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			conn, err := session.currentConn()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// wrapperTimeoutThreshold timeouts inside the window declare it
+			// wedged; drive exactly that many, on distinct tracks.
+			for i := 0; i < wrapperTimeoutThreshold; i++ {
+				instance.observeWrapperIOFailure(
+					context.Background(), conn,
+					fmt.Sprintf("adam-%d", i), tc.stage, tc.conclusive,
+					&net.OpError{Op: "read", Err: &timeoutError{}},
+				)
+			}
+
+			instance.poolMu.Lock()
+			wedged := instance.isClosed
+			instance.poolMu.Unlock()
+			if wedged != tc.wantWedged {
+				t.Errorf("instance quarantined = %v after %d %q timeouts, want %v",
+					wedged, wrapperTimeoutThreshold, tc.stage, tc.wantWedged)
+			}
+		})
+	}
+}
+
+// timeoutError is a net.Error that reports Timeout, which is what
+// classifyLocalWrapperIOError keys on.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }

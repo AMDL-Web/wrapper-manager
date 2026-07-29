@@ -69,6 +69,9 @@ const (
 	// one this replaces, and decryptWithFailover has already rescued the samples
 	// spent getting there.
 	wrapperTimeoutThreshold = 2
+	// firstSampleStage names the operation whose timeouts are routed only to
+	// the streak rule; observeWrapperIOFailure compares against it.
+	firstSampleStage = "first decrypt after context switch"
 )
 
 // The effective deadlines, overridable at startup by -decrypt-timeout and
@@ -145,6 +148,14 @@ type DecryptInstance struct {
 	healthMu sync.Mutex
 	failures []wrapperIOFailure
 	timeouts []time.Time
+	// firstSampleTimeouts is deliberately separate from timeouts. The two
+	// count different populations under the same threshold: a steady-state
+	// timeout is evidence that survives its window, while a first-sample one
+	// is only evidence as an unbroken streak, and is dropped the moment any
+	// first sample completes. Sharing one slice let a completed first sample
+	// erase steady-state evidence, which un-quarantined a genuinely wedged
+	// wrapper on every context switch.
+	firstSampleTimeouts []time.Time
 
 	closeOnce       sync.Once
 	unavailableOnce sync.Once
@@ -457,13 +468,21 @@ func (s *DecryptSession) Decrypt(adamId, key string, payload []byte) ([]byte, er
 	elapsed := time.Since(started)
 	if switched {
 		s.firstLatency.observe(elapsed)
+		if err == nil {
+			// This instance can still complete a key setup, however slowly, so
+			// whatever timeouts preceded this were slowness and not a wedge.
+			s.instance.resetFirstSampleFailures()
+		}
 	} else {
 		s.latency.observe(elapsed)
 	}
 	if err != nil {
 		stage, conclusive := "decrypt", true
 		if switched {
-			stage, conclusive = "first decrypt after context switch", false
+			// A first decrypt after a context switch is slow by nature, so
+			// merely exceeding the budget says nothing — except when the
+			// wrapper produced no bytes at all. See observeWrapperIOFailure.
+			stage, conclusive = firstSampleStage, read == 0
 		}
 		s.instance.observeWrapperIOFailure(s.ctx, c, adamId, stage, conclusive, err)
 		local, _ := classifyLocalWrapperIOError(s.ctx, err)
@@ -497,19 +516,35 @@ func classifyLocalWrapperIOError(ctx context.Context, err error) (local, timedOu
 	return true, netErr.Timeout()
 }
 
-// observeWrapperTimeout records one timeout and reports whether the instance
-// has now produced enough of them inside the window to be called wedged.
-func (d *DecryptInstance) observeWrapperTimeout(now, cutoff time.Time) bool {
+// resetFirstSampleFailures clears the consecutive-empty-first-sample streak.
+// Called whenever a first decrypt after a context switch completes, which is
+// the one observation that separates a slow instance from a wedged one. It
+// leaves the steady-state timeouts alone; those mean something this does not
+// disprove.
+func (d *DecryptInstance) resetFirstSampleFailures() {
+	d.healthMu.Lock()
+	d.firstSampleTimeouts = d.firstSampleTimeouts[:0]
+	d.healthMu.Unlock()
+}
+
+// observeWrapperTimeout records one timeout against the counter for its kind
+// and reports whether the instance has now produced enough of them inside the
+// window to be called wedged.
+func (d *DecryptInstance) observeWrapperTimeout(now, cutoff time.Time, firstSample bool) bool {
 	d.healthMu.Lock()
 	defer d.healthMu.Unlock()
-	kept := d.timeouts[:0]
-	for _, at := range d.timeouts {
+	counter := &d.timeouts
+	if firstSample {
+		counter = &d.firstSampleTimeouts
+	}
+	kept := (*counter)[:0]
+	for _, at := range *counter {
 		if !at.Before(cutoff) {
 			kept = append(kept, at)
 		}
 	}
-	d.timeouts = append(kept, now)
-	return len(d.timeouts) >= wrapperTimeoutThreshold
+	*counter = append(kept, now)
+	return len(*counter) >= wrapperTimeoutThreshold
 }
 
 // observeWrapperIOFailure feeds one local failure into the health rules.
@@ -517,17 +552,31 @@ func (d *DecryptInstance) observeWrapperTimeout(now, cutoff time.Time) bool {
 // timeoutIsConclusive says whether exceeding this operation's budget is evidence
 // about the process at all. It is true where the budget sits orders of magnitude
 // above the whole observed distribution — a steady-state decrypt at 2s against a
-// 4.751 ms worst case, a context-switch write at 2s against 131 µs. It is false
-// for the first decrypt after a context switch, which is slow by nature: healthy
-// instances have been measured past ten seconds there, so a timeout says nothing
-// except that this one operation was slow.
+// 4.751 ms worst case, a context-switch write at 2s against 131 µs.
 //
-// A non-conclusive timeout therefore feeds neither health rule — not the timeout
-// counter, and not the general failure window either. Letting it reach the
-// general rule only moves the misfire: an album produces one such operation per
-// track, which is exactly the spread of distinct connections and Adam IDs that
-// rule is looking for, and three slow tracks would restart a healthy wrapper.
-// The sample is not lost regardless; the caller fails it over.
+// The first decrypt after a context switch is the hard case, because it is slow
+// by nature: healthy instances have been measured past ten seconds, so the
+// elapsed time alone says nothing. Feeding those to the general failure rule is
+// a misfire waiting to happen — an album produces one such operation per track,
+// which is exactly the spread of distinct connections and Adam IDs that rule
+// looks for, so three slow tracks would restart a healthy wrapper.
+//
+// Whether any bytes came back separates the two populations cleanly, and the
+// caller passes that in. A wedged wrapper on 2026-07-29 produced first-sample
+// reads landing on the deadline to the millisecond — 30.000185s, 30.000409s,
+// 30.000725s, 30.001491s, 30.001788s — with nothing read, while the same
+// instance after a restart ran the identical album at 419 ms to 2.16 s. A slow
+// operation completes, or at worst stalls partway through a reply; an operation
+// that returns zero bytes after thirty seconds never got an answer at all. That
+// is not slowness, and treating it as slowness is why both instances in that
+// outage failed over to each other for an hour while Status kept reporting
+// ready and nothing ever restarted them.
+//
+// So: a timeout with a partial read stays non-conclusive and feeds neither
+// health rule. A timeout with an empty read is counted, and the existing
+// wrapperTimeoutThreshold still requires two of them inside the window before
+// the instance is declared wedged. The sample is not lost either way; the
+// caller fails it over.
 func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *decryptConn, adamID, stage string, timeoutIsConclusive bool, err error) {
 	local, timedOut := classifyLocalWrapperIOError(ctx, err)
 	if conn == nil || adamID == "" || !local {
@@ -539,6 +588,7 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 	if closed {
 		return
 	}
+	firstSample := stage == firstSampleStage
 	if timedOut && !timeoutIsConclusive {
 		logrus.Warnf("wrapper instance %s local %s exceeded its %s budget for Adam ID %s; failing the sample over without counting it against instance health: %v", d.id, stage, d.firstSampleTimeout, adamID, err)
 		return
@@ -549,11 +599,20 @@ func (d *DecryptInstance) observeWrapperIOFailure(ctx context.Context, conn *dec
 	}
 	cutoff := now.Add(-wrapperFailureWindow)
 
-	if timedOut && d.observeWrapperTimeout(now, cutoff) {
+	if timedOut && d.observeWrapperTimeout(now, cutoff, firstSample) {
 		d.Unavailable(fmt.Sprintf(
 			"%d local I/O timeouts in %s, most recently %s for Adam ID %s",
 			wrapperTimeoutThreshold, wrapperFailureWindow, stage, adamID,
 		))
+		return
+	}
+	// An empty first sample feeds the streak rule above and stops there. The
+	// general rule counts distinct connections and Adam IDs, and an album
+	// produces exactly that spread — one first sample per track — so letting
+	// these through would only move the misfire the streak rule was built to
+	// avoid. Slowness is caught by the streak resetting on any completion;
+	// nothing else about a first sample is evidence.
+	if firstSample && timedOut {
 		return
 	}
 

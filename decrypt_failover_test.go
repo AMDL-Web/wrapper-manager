@@ -238,6 +238,15 @@ func TestFirstSampleAfterContextSwitchGetsTheLongerDeadline(t *testing.T) {
 // after a context switch has no characterised ceiling — healthy instances have
 // been measured past ten seconds — so exceeding its budget must cost the sample
 // a failover and nothing more.
+//
+// Amended 2026-07-29. This test used to block the first sample FOREVER, which is
+// not a slow instance — it is the wedge, and asserting that it must not be
+// condemned is what let two wrappers fail over to each other for an hour with
+// Status reporting ready the whole time. What the test means to protect is an
+// instance that is slow and still gets there, so that is what it now models: the
+// timeouts are interleaved with completions. The streak resets on any completed
+// first sample, so slowness never accumulates into a verdict.
+// TestEmptyFirstSampleTimeoutCondemnsTheInstance covers the other population.
 func TestSlowFirstSampleDoesNotCountAgainstInstanceHealth(t *testing.T) {
 	server := newFakeDecryptServer(t)
 	instance, err := NewDecryptInstance(&WrapperInstance{Id: "test", Region: "cn", DecryptPort: server.port()})
@@ -257,6 +266,8 @@ func TestSlowFirstSampleDoesNotCountAgainstInstanceHealth(t *testing.T) {
 
 	// Far more than either health threshold, across distinct connections and
 	// songs so the general failure rule would trip too if these reached it.
+	// Each slow first sample is followed by one that completes, which is what
+	// "slow but healthy" means and what a wedged instance can never produce.
 	for i, adamID := range []string{"song-1", "song-2", "song-3", "song-4"} {
 		session, err := instance.OpenSession(context.Background(), adamID, fmt.Sprintf("key-%d", i))
 		if err != nil {
@@ -265,6 +276,17 @@ func TestSlowFirstSampleDoesNotCountAgainstInstanceHealth(t *testing.T) {
 		if _, err := session.Decrypt(adamID, fmt.Sprintf("key-%d", i), []byte("block")); err == nil {
 			t.Fatal("expected the first sample to exceed its budget")
 		}
+		session.Close()
+		// A fresh session, so this decrypt is itself a first-after-switch — and
+		// it succeeds, proving the wrapper still does key setup.
+		recovered, err := instance.OpenSession(context.Background(), adamID, fmt.Sprintf("key-%d", i))
+		if err != nil {
+			t.Fatalf("instance stopped serving after %d slow first samples: %v", i, err)
+		}
+		if _, err := recovered.Decrypt(adamID, fmt.Sprintf("key-%d", i), []byte("ok")); err != nil {
+			t.Fatalf("a healthy first sample failed: %v", err)
+		}
+		recovered.Close()
 	}
 
 	select {
@@ -315,5 +337,78 @@ func TestSteadyStateTimeoutsStillQuarantine(t *testing.T) {
 	case <-terminated:
 	case <-time.After(2 * time.Second):
 		t.Fatal("steady-state timeouts no longer quarantine a wedged wrapper")
+	}
+}
+
+// TestFirstSampleWedgeIsCondemnedThroughDecrypt is the end-to-end counterpart to
+// TestEmptyFirstSampleTimeoutCondemnsTheInstance. That test calls
+// observeWrapperIOFailure directly and hands it the conclusive flag, so it pins
+// the rule but not the wiring — with it alone, a caller that stopped deriving
+// the flag from the read count would go unnoticed, which is precisely the
+// regression that caused the 2026-07-29 outage. This one drives real Decrypt
+// calls against a server that produces each population.
+func TestFirstSampleWedgeIsCondemnedThroughDecrypt(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		payload    string
+		wantWedged bool
+	}{
+		// Nothing ever comes back. Thirty seconds of silence is not a slow key
+		// setup, it is a wrapper that never answered.
+		{name: "first samples return no bytes at all", payload: "block", wantWedged: true},
+		// Bytes come back and then it stalls. Slow, but it is talking.
+		{name: "first samples return bytes then stall", payload: "partial-block", wantWedged: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newFakeDecryptServer(t)
+			instance, err := NewDecryptInstance(&WrapperInstance{Id: "wedge-e2e", Region: "cn", DecryptPort: server.port()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(instance.Close)
+			instance.ioTimeout = 30 * time.Millisecond
+			instance.firstSampleTimeout = 30 * time.Millisecond
+			terminated := make(chan struct{}, 8)
+			instance.terminateWrapper = func() error {
+				terminated <- struct{}{}
+				return nil
+			}
+
+			// Each iteration opens a fresh session, so every decrypt below is a
+			// first-after-context-switch and is charged the first-sample budget.
+			// No successful sample is interleaved: this is an unbroken streak.
+			for i := 0; i < wrapperTimeoutThreshold; i++ {
+				adamID := fmt.Sprintf("song-%d", i)
+				session, err := instance.OpenSession(context.Background(), adamID, fmt.Sprintf("key-%d", i))
+				if err != nil {
+					if tc.wantWedged {
+						break // already condemned, which is the point
+					}
+					t.Fatalf("instance stopped serving after %d slow first samples: %v", i, err)
+				}
+				if _, err := session.Decrypt(adamID, fmt.Sprintf("key-%d", i), []byte(tc.payload)); err == nil {
+					t.Fatal("expected the first sample to exceed its budget")
+				}
+				session.Close()
+			}
+
+			instance.poolMu.Lock()
+			wedged := instance.isClosed
+			instance.poolMu.Unlock()
+			if wedged != tc.wantWedged {
+				t.Errorf("instance quarantined = %v after %d first-sample timeouts, want %v",
+					wedged, wrapperTimeoutThreshold, tc.wantWedged)
+			}
+			select {
+			case <-terminated:
+				if !tc.wantWedged {
+					t.Error("a slow but responsive wrapper was restarted")
+				}
+			case <-time.After(100 * time.Millisecond):
+				if tc.wantWedged {
+					t.Error("a wedged wrapper was never restarted")
+				}
+			}
+		})
 	}
 }
