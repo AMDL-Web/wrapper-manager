@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.23 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath -ldflags="-s -w" -o /out/wrapper-manager .
 
-FROM debian:13.2
+FROM debian:13.6
 
 WORKDIR /root
 
