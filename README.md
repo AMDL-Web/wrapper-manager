@@ -1,3 +1,5 @@
+> **Moved.** This fork now lives in [AMDL-Web/wrapper](https://github.com/AMDL-Web/wrapper) under [`manager/`](https://github.com/AMDL-Web/wrapper/tree/lite/manager), next to the wrapper-lite it supervises. This repository is archived.
+
 # wrapper-manager
 A tool for managing multiple Wrapper instances
 
